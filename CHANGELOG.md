@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.1
+
+- fix: **`import docs_core` 不再依赖数据根**。`kb_migration_audit` 的审计路径此前是模块级常量
+  （`AUDIT_PATH = resolve_data_root() / "ops" / ...`），import 期就解析路径——独立安装（wheel）里
+  若还没配 `KNOWLEDGE_BASE_DIR` / `ANGINEER_DATA_ROOT` / `ANGINEER_REPO_ROOT`，`import docs_core`
+  直接抛 `RuntimeError`（发布后 PyPI 实装验收抓到）。现改为 `audit_path()` 延迟解析，只有真正读写审计时才解析。
+- chore: 两处测试随之从 patch 常量改为 patch 函数；`test_kb_migrator_preview` 里"审计路径在 import 期就绑死、
+  conftest 的环境隔离拦不住"那条注释作废（该坑随本版修复消失）。
+- 说明：数据根仍须在**使用解析/审计前**配好，只是报错点从 import 期挪到了调用点（错误信息不变，仍会明确提示给哪个变量）。
+
 ## 0.1.0（对外发布基线）
 
 首个对外发布版本：AnGIneer 的文档解析入库引擎从主仓库（`services/docs-core`）独立成包。
