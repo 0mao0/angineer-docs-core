@@ -1,0 +1,1011 @@
+"""公式结构化提取工具（step04 enrich：04 生产落 jsonl，05 对 popo 块透传、对 solo 块规则兜底）。
+
+语义层契约：输入 ``CanonicalBlock``（block_type=="formula"）及其下文解释段
+（section_path + reading_order 邻近定位），输出 ``FormulaSemanticsContract``。
+契约挂 ``CanonicalBlock.formula_semantics`` 旁路字段（构建期）；
+graph node meta / derived_rows 的最终挂载点由后续统一投影确定。
+"""
+import json
+import logging
+import re
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, TypedDict
+
+from docs_core.models.types import CanonicalBlock
+
+if TYPE_CHECKING:
+    from ai_inference.llm_client import LLMClient
+
+logger = logging.getLogger(__name__)
+
+
+FORMULA_NUMBER_RE = re.compile(
+    r"[（(](\d+(?:\.\d+)*(?:-\d+)?)[）)]|\\tag\{(\d+(?:\.\d+)*(?:-\d+)?)\}"
+)
+FORMULA_PARAM_SYMBOL_RE = r"[A-Za-zΑ-Ωα-ω\\][A-Za-z0-9_{}^()\\/.\-']{0,20}"
+FORMULA_PARAM_RE = re.compile(
+    rf"^\s*({FORMULA_PARAM_SYMBOL_RE})\s*(?:[—–\-一]{{1,3}}|:=|=|：|:)\s*(.+?)\s*$"
+)
+FORMULA_PARAM_SOFT_RE = re.compile(rf"^\s*({FORMULA_PARAM_SYMBOL_RE})\s+(.+?)\s*$")
+REFERENCE_HINT_RE = re.compile(r"(采用[^；。]*|按[^；。]*|取[^；。]*|见[^；。]*|按表[^；。]*)")
+UNIT_RE = re.compile(r"[（(]([^()（）]{1,20})[）)]")
+JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+_FORMULA_TAG_STRIP_RE = re.compile(r"\\tag(?:\*)?\s*\{[^{}]*\}")
+_SYMBOL_ARG_COMMANDS = {
+    "mathrm",
+    "text",
+    "mathit",
+    "mathbf",
+    "pmb",
+    "boldsymbol",
+    "bm",
+    "mbox",
+    "operatorname",
+}
+_GREEK_COMMAND_LOWER = {
+    "alpha", "beta", "gamma", "delta", "epsilon", "varepsilon", "zeta",
+    "eta", "theta", "vartheta", "iota", "kappa", "lambda", "mu", "nu",
+    "xi", "pi", "rho", "varrho", "sigma", "varsigma", "tau", "upsilon",
+    "phi", "varphi", "chi", "psi", "omega", "digamma", "beth", "aleph",
+    "ell", "hbar", "imath", "jmath",
+}
+
+
+class FormulaParamContract(TypedDict):
+    """公式参数语义契约。"""
+
+    symbol: str
+    description: str
+    unit: Optional[str]
+    reference_hint: Optional[str]
+    confidence: float
+    extracted_by: str
+
+
+class FormulaSemanticsContract(TypedDict):
+    """公式语义图契约。"""
+
+    formula_text: str
+    formula_body: str
+    formula_number: Optional[str]
+    formula_params: List[FormulaParamContract]
+    formula_param_count: int
+    formula_summary: str
+    llm_status: str
+    explanation_lines: List[str]
+
+
+# 清洗公式相关文本，避免空白和尾部标点干扰规则识别。
+def clean_formula_text(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    return normalized.strip("；;")
+
+
+# 从公式正文或说明文本中提取公式编号。
+def extract_formula_number(formula_text: str, explanation_lines: List[str]) -> Optional[str]:
+    search_candidates = [clean_formula_text(formula_text), *[clean_formula_text(line) for line in explanation_lines]]
+    for candidate in search_candidates:
+        if not candidate:
+            continue
+        match = FORMULA_NUMBER_RE.search(candidate)
+        if match:
+            return match.group(1) or match.group(2)
+    return None
+
+
+def strip_formula_tag(text: str) -> str:
+    """去掉公式末尾的 \\tag{...}，保留纯公式体。"""
+    cleaned = clean_formula_text(text)
+    return _FORMULA_TAG_STRIP_RE.sub("", cleaned).strip()
+
+
+# 将说明段拆成便于逐条解析的候选行。
+def split_formula_explanation_lines(explanation_lines: List[str]) -> List[str]:
+    lines: List[str] = []
+    for raw_line in explanation_lines:
+        cleaned = clean_formula_text(raw_line)
+        if not cleaned:
+            continue
+        parts = re.split(r"[\r\n]+", cleaned)
+        for part in parts:
+            text = clean_formula_text(part)
+            if not text:
+                continue
+            sub_parts = re.split(r"[；;]\s*(?=(?:式中|其中|注[:：]?)?\s*[A-Za-zΑ-Ωα-ω\\])", text)
+            for sub_part in sub_parts:
+                final_text = clean_formula_text(sub_part)
+                if final_text:
+                    lines.append(final_text)
+    return list(dict.fromkeys(lines))
+
+
+# 识别说明行中的单位信息。
+def extract_formula_unit(description: str) -> Optional[str]:
+    for match in UNIT_RE.finditer(description):
+        unit = clean_formula_text(match.group(1))
+        if not unit:
+            continue
+        if re.search(r"[A-Za-z%°/]|m\d?|kg|kN|MPa|N", unit, re.IGNORECASE) or any(ch in unit for ch in ("m", "kg", "度", "%", "°")):
+            return unit
+    return None
+
+
+# 从说明行中提取引用来源或取值提示。
+def extract_formula_reference_hint(description: str) -> Optional[str]:
+    match = REFERENCE_HINT_RE.search(description)
+    if not match:
+        return None
+    return clean_formula_text(match.group(1))
+
+
+# 用规则解析单条公式参数说明。
+def parse_formula_param_rule(line: str) -> Optional[Dict[str, Any]]:
+    candidate = clean_formula_text(line)
+    if not candidate:
+        return None
+    candidate = re.sub(r"^[•·]\s*", "", candidate)
+    candidate = re.sub(r"^(?:式中|其中|注)[:：]?\s*", "", candidate)
+    match = FORMULA_PARAM_RE.match(candidate)
+    if not match:
+        soft_match = FORMULA_PARAM_SOFT_RE.match(candidate)
+        if soft_match:
+            symbol_candidate = clean_formula_text(soft_match.group(1))
+            description_candidate = clean_formula_text(soft_match.group(2))
+            if (
+                symbol_candidate
+                and description_candidate
+                and re.search(r"[\u4e00-\u9fff(（]", description_candidate)
+                and not description_candidate.startswith(("+", "-", "*", "/", "="))
+                and not description_candidate.startswith(("_", "{", "\\", "^", "~"))
+                and not symbol_candidate.startswith("\\")
+            ):
+                match = soft_match
+    if not match:
+        return None
+
+    symbol = clean_formula_text(match.group(1))
+    description = clean_formula_text(match.group(2))
+    if not symbol or not description:
+        return None
+
+    return {
+        "symbol": symbol,
+        "description": description,
+        "unit": extract_formula_unit(description),
+        "reference_hint": extract_formula_reference_hint(description),
+        "confidence": 0.92,
+        "extracted_by": "rule",
+    }
+
+
+# 将模型输出尽量恢复为 JSON 对象。
+def parse_formula_llm_json(payload_text: str) -> Optional[Dict[str, Any]]:
+    raw = str(payload_text or "").strip()
+    if not raw:
+        return None
+    block_match = JSON_BLOCK_RE.search(raw)
+    if block_match:
+        raw = block_match.group(1).strip()
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _clean_llm_params(raw_params: Any) -> List[Dict[str, Any]]:
+    """过滤并规范化 LLM 返回的参数项：symbol/description 任一为空即丢弃。"""
+    out: List[Dict[str, Any]] = []
+    if not isinstance(raw_params, list):
+        return out
+    for item in raw_params:
+        if not isinstance(item, dict):
+            continue
+        symbol = clean_formula_text(str(item.get("symbol") or ""))
+        description = clean_formula_text(str(item.get("description") or ""))
+        if not symbol or not description:
+            continue
+        confidence_raw = item.get("confidence", 0.8)
+        confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else 0.8
+        out.append(
+            {
+                "symbol": symbol,
+                "description": description,
+                "unit": clean_formula_text(str(item.get("unit") or "")) or extract_formula_unit(description),
+                "reference_hint": clean_formula_text(str(item.get("reference_hint") or "")) or extract_formula_reference_hint(description),
+                "confidence": max(0.0, min(1.0, confidence)),
+                "extracted_by": "llm",
+            }
+        )
+    return out
+
+
+# 使用 LLM 兜底解析复杂公式说明。
+def llm_extract_formula_params(
+    formula_text: str,
+    explanation_lines: List[str],
+    llm_client: Optional["LLMClient"] = None,
+    llm_model: Optional[str] = None,
+) -> tuple[List[Dict[str, Any]], str]:
+    if not llm_client:
+        return [], "not_configured"
+    if not explanation_lines:
+        return [], "empty_context"
+
+    system_prompt = (
+        "你是工程规范中的公式说明结构化提取器。"
+        "请从公式及其“式中/其中”说明中提取参数项，仅返回 JSON 对象。"
+        '输出格式: {"params":[{"symbol":"γ","description":"风、流压缩角","unit":"^circ","reference_hint":"采用表6.4.2-2中的数值","confidence":0.85}]}\n'
+        "如果某字段缺失可返回 null；不要输出额外解释。"
+    )
+    user_prompt = json.dumps(
+        {
+            "formula_text": clean_formula_text(formula_text),
+            "explanation_lines": split_formula_explanation_lines(explanation_lines),
+        },
+        ensure_ascii=False,
+    )
+
+    try:
+        result_text = llm_client.chat(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            model=llm_model,
+        )
+        parsed = parse_formula_llm_json(result_text)
+        if not parsed:
+            return [], "invalid_json"
+        raw_params = parsed.get("params")
+        if not isinstance(raw_params, list):
+            return [], "empty_result"
+
+        params = _clean_llm_params(raw_params)
+        return params, "ok" if params else "empty_result"
+    except Exception as error:
+        return [], f"error:{str(error)[:60]}"
+
+
+_FORMULA_LLM_BATCH_SIZE = 3
+_BATCH_SYSTEM_PROMPT = (
+    "你是工程规范中的公式说明结构化提取器。"
+    "请从公式及其“式中/其中”说明中提取参数项，仅返回 JSON 对象。"
+    "输出格式: {\"formulas\":[{\"index\":0,\"params\":[{\"symbol\":\"γ\",\"description\":\"风、流压缩角\",\"unit\":\"^circ\",\"reference_hint\":\"采用表6.4.2-2中的数值\",\"confidence\":0.85}]}]}\n"
+    "index 必须对应输入列表中的顺序；每条公式都要输出 params，没有参数就返回空数组。"
+    "如果某字段缺失可返回 null；不要输出额外解释。"
+)
+
+
+def _parse_batch_llm_response(result_text: str) -> Optional[Dict[int, List[Dict[str, Any]]]]:
+    """解析批量响应为 {index: 参数列表}；整批无法解析时返回 None。"""
+    parsed = parse_formula_llm_json(result_text)
+    if not parsed:
+        return None
+    raw_list = parsed.get("formulas") or parsed.get("results") or parsed.get("items")
+    by_index: Dict[int, List[Dict[str, Any]]] = {}
+    if isinstance(raw_list, list):
+        for pos, item in enumerate(raw_list):
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            if idx is None:
+                idx = pos
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                continue
+            by_index[idx] = _clean_llm_params(item.get("params"))
+    return by_index
+
+
+def _request_formula_batch(
+    group: List[Dict[str, Any]],
+    llm_client: Optional["LLMClient"],
+    llm_model: Optional[str],
+) -> Optional[Dict[int, List[Dict[str, Any]]]]:
+    """发起一个批组的 LLM 请求；整批解析失败或调用异常返回 None。"""
+    user_prompt = json.dumps(
+        {
+            "formulas": [
+                {
+                    "index": idx,
+                    "formula_text": clean_formula_text(item["formula_text"]),
+                    "explanation_lines": split_formula_explanation_lines(item["explanation_lines"]),
+                }
+                for idx, item in enumerate(group)
+            ]
+        },
+        ensure_ascii=False,
+    )
+    try:
+        result_text = llm_client.chat(
+            messages=[
+                {"role": "system", "content": _BATCH_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            model=llm_model,
+        )
+    except Exception as error:
+        logger.warning("公式批量提取调用失败: %s", str(error)[:160])
+        return None
+    return _parse_batch_llm_response(result_text)
+
+
+def _process_formula_batch_group(
+    group: List[Dict[str, Any]],
+    llm_client: Optional["LLMClient"],
+    llm_model: Optional[str],
+) -> Dict[str, Tuple[List[Dict[str, Any]], str]]:
+    """单个批组：整批解析失败重试一次，仍失败按二分拆组兜底。"""
+    parsed = None
+    for attempt in range(2):
+        parsed = _request_formula_batch(group, llm_client, llm_model)
+        if parsed is not None:
+            if attempt == 1:
+                logger.warning("公式批量提取整批解析失败，重试成功: %d 条", len(group))
+            break
+    if parsed is not None:
+        out: Dict[str, Tuple[List[Dict[str, Any]], str]] = {}
+        for idx, item in enumerate(group):
+            params = parsed.get(idx)
+            if params is None:
+                params = []
+            out[item["key"]] = (params, "ok" if params else "empty_result")
+        return out
+    if len(group) <= 1:
+        logger.warning("公式批量提取重试仍失败，回退规则: %s", group[0]["key"])
+        return {group[0]["key"]: ([], "invalid_json")}
+    logger.warning("公式批量提取重试仍失败，拆半重试: %d 条", len(group))
+    mid = len(group) // 2
+    out = {}
+    out.update(_process_formula_batch_group(group[:mid], llm_client, llm_model))
+    out.update(_process_formula_batch_group(group[mid:], llm_client, llm_model))
+    return out
+
+
+def llm_extract_formula_params_batch(
+    items: List[Dict[str, Any]],
+    llm_client: Optional["LLMClient"] = None,
+    llm_model: Optional[str] = None,
+    batch_size: int = _FORMULA_LLM_BATCH_SIZE,
+) -> Dict[str, Tuple[List[Dict[str, Any]], str]]:
+    """批量 LLM 提取公式参数（默认 3 个/批，含整批失败重试一次 + 拆半兜底）。
+
+    items: [{"key": 块标识, "formula_text": 公式文本, "explanation_lines": 说明行}]
+    返回 {key: (params, status)}；单项失败由调用方回退规则提取。
+    """
+    if not items or not llm_client:
+        return {}
+    result: Dict[str, Tuple[List[Dict[str, Any]], str]] = {}
+    for i in range(0, len(items), max(1, batch_size)):
+        group = items[i:i + max(1, batch_size)]
+        result.update(_process_formula_batch_group(group, llm_client, llm_model))
+    return result
+
+
+# 合并规则结果与 LLM 结果，优先保留规则字段。
+def merge_formula_params(
+    rule_params: List[Dict[str, Any]],
+    llm_params: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for item in llm_params + rule_params:
+        symbol = clean_formula_text(str(item.get("symbol") or ""))
+        if not symbol:
+            continue
+        existing = merged.get(symbol, {})
+        merged[symbol] = {
+            "symbol": symbol,
+            "description": existing.get("description") or item.get("description"),
+            "unit": existing.get("unit") or item.get("unit"),
+            "reference_hint": existing.get("reference_hint") or item.get("reference_hint"),
+            "confidence": max(float(existing.get("confidence") or 0.0), float(item.get("confidence") or 0.0)),
+            "extracted_by": existing.get("extracted_by") or item.get("extracted_by"),
+        }
+        if existing.get("extracted_by") == "llm" and item.get("extracted_by") == "rule":
+            merged[symbol]["extracted_by"] = "rule"
+    return list(merged.values())
+
+
+# 规范化 LaTeX 符号：去掉格式化命令与花括号/空白，得到可比较的规范形；
+# 希腊命令（\\sigma 等）作为基础符号整体保留。
+def _normalize_symbol_tex(text: str) -> str:
+    value = str(text or "")
+
+    def _replace_cmd_arg(match: re.Match) -> str:
+        cmd = match.group(1)
+        if cmd.lower() in _GREEK_COMMAND_LOWER:
+            return "\\" + cmd + match.group(2)
+        return match.group(2)
+
+    value = re.sub(r"\\([A-Za-z]+)(\s*\{[^{}]*\})", _replace_cmd_arg, value)
+    value = re.sub(
+        r"\\[A-Za-z]+",
+        lambda m: m.group(0) if m.group(0)[1:].lower() in _GREEK_COMMAND_LOWER else "",
+        value,
+    )
+    return re.sub(r"[\s{}_]", "", value)
+
+
+def _is_symbol_letter(ch: str) -> bool:
+    return (
+        (ch.isascii() and ch.isalpha())
+        or "\u0391" <= ch <= "\u03a9"
+        or "\u03b1" <= ch <= "\u03c9"
+    )
+
+
+def _parse_subscript_at(text: str, pos: int) -> Tuple[str, int]:
+    """从 pos 解析可选下标，返回（下标原文, 解析后位置）。"""
+    j = pos
+    n = len(text)
+    while j < n and text[j].isspace():
+        j += 1
+    if j >= n or text[j] != "_":
+        return "", j
+    j += 1
+    while j < n and text[j].isspace():
+        j += 1
+    if j < n and text[j] == "{":
+        depth = 1
+        start = j
+        j += 1
+        while j < n and depth > 0:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+            j += 1
+        return text[start:j], j
+    sub_match = re.match(r"[A-Za-z0-9]+", text[j:])
+    if sub_match:
+        return sub_match.group(0), j + len(sub_match.group(0))
+    return "", j
+
+
+def _iter_formula_symbol_tokens(formula_text: str):
+    """从公式原文提取符号 token（原文片段, 基础符号, 规范形）。
+
+    跳过 LaTeX 命令名与普通命令的花括号参数；\\mathrm/pmb 等“符号承载”命令的
+    花括号参数保留参与扫描，希腊命令（\\sigma 等）整体作为基础符号。
+    """
+    text = str(formula_text or "")
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 1
+            name_start = i
+            while i < n and text[i].isalpha():
+                i += 1
+            cmd = text[name_start:i]
+            j = i
+            while j < n and text[j].isspace():
+                j += 1
+            if cmd.lower() in _GREEK_COMMAND_LOWER:
+                sub_raw, j = _parse_subscript_at(text, j)
+                base = "\\" + cmd
+                raw = text[name_start - 1:j]
+                canonical = base + _normalize_symbol_tex(sub_raw)
+                yield raw, base, canonical
+                i = j
+                continue
+            if j < n and text[j] == "{" and cmd not in _SYMBOL_ARG_COMMANDS:
+                depth = 0
+                i = j
+                while i < n:
+                    if text[i] == "{":
+                        depth += 1
+                    elif text[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            i += 1
+                            break
+                    i += 1
+                continue
+            i = j
+            continue
+        if _is_symbol_letter(ch):
+            start = i
+            base = ch
+            i += 1
+            sub_raw, i = _parse_subscript_at(text, i)
+            raw = text[start:i].strip()
+            canonical = base + _normalize_symbol_tex(sub_raw)
+            yield raw, base, canonical
+            continue
+        i += 1
+
+
+def _symbol_base(raw_symbol: str) -> str:
+    """提取符号基础：\\sigma 等希腊命令或单字母。"""
+    text = str(raw_symbol or "").strip()
+    cmd_match = re.match(r"\\([A-Za-z]+)", text)
+    if cmd_match and cmd_match.group(1).lower() in _GREEK_COMMAND_LOWER:
+        return cmd_match.group(0)
+    letter_match = re.match(r"[A-Za-zΑ-Ωα-ω]", text)
+    return letter_match.group(0) if letter_match else ""
+
+
+def _extract_subscript_tex(symbol: str) -> Optional[str]:
+    """提取参数符号的下标 LaTeX 原文（支持嵌套花括号，如 {\\mathrm{aa v}}）。"""
+    text = str(symbol or "")
+    idx = text.find("_")
+    if idx < 0:
+        return None
+    j = idx + 1
+    n = len(text)
+    while j < n and text[j].isspace():
+        j += 1
+    if j < n and text[j] == "{":
+        depth = 1
+        start = j
+        j += 1
+        while j < n and depth > 0:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+            j += 1
+        return text[start:j]
+    sub_match = re.match(r"[A-Za-z0-9]+", text[j:])
+    return sub_match.group(0) if sub_match else None
+
+
+def _rebuild_token_from_param(token_raw: str, param_symbol: str) -> str:
+    """用参数符号重建公式 token：基础符号 + 参数下标（原始下标以参数为准）。"""
+    param_sub = _extract_subscript_tex(param_symbol)
+    base = _symbol_base(token_raw)
+    if param_sub is None:
+        return base
+    return f"{base}_{param_sub}"
+
+
+def _build_symbol_corrections(
+    formula_text: str,
+    params: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """检测公式内符号与参数符号不一致，产出 corrected 修正项。
+
+    参数符号在公式中出现（基础符号一致）但完整规范形不一致时，视为 OCR/排版
+    差异（如下标误识），生成 ``math_content_corrected`` 修正项。仅当某个基础
+    符号只有一个参数时允许修正（可消歧）；同基础符号多个参数（如 D 与 D_0）
+    时跳过，避免把正确符号误改。
+    """
+    tokens = list(_iter_formula_symbol_tokens(formula_text))
+    if not tokens:
+        return []
+    token_bases = {base for _raw, base, _canonical in tokens}
+    canonicals_by_base: Dict[str, set] = {}
+    raw_by_base: Dict[str, str] = {}
+    for raw, base, canonical in tokens:
+        canonicals_by_base.setdefault(base, set()).add(canonical)
+        raw_by_base.setdefault(base, raw)
+    params_by_base: Dict[str, List[Dict[str, Any]]] = {}
+    for param in params or []:
+        symbol = clean_formula_text(str(param.get("symbol") or ""))
+        if not symbol:
+            continue
+        normalized = _normalize_symbol_tex(symbol)
+        base = _symbol_base(symbol)
+        if not base:
+            continue
+        if base not in token_bases:
+            continue
+        params_by_base.setdefault(base, []).append(
+            {"symbol": symbol, "normalized": normalized}
+        )
+    corrections: List[Dict[str, Any]] = []
+    for base, base_params in params_by_base.items():
+        if len(base_params) != 1:
+            continue
+        item = base_params[0]
+        if item["normalized"] in canonicals_by_base.get(base, set()):
+            continue
+        raw_token = raw_by_base.get(base) or ""
+        # 禁止"删下标"式修正（2026-09-14 生产实踩，462 块公式被改坏）：
+        # 说明段的参数符号常写成泛指基础符号（F、a），不代表公式里的下标是错的；
+        # 拿无下标参数当真相源会把 F_{1}→F、a_{1}→a，直接丢失语义。
+        # 修正只允许补/换下标（参数带下标时），不允许删下标。
+        if (
+            _extract_subscript_tex(item["symbol"]) is None
+            and _extract_subscript_tex(raw_token) is not None
+        ):
+            continue
+        corrected_token = _rebuild_token_from_param(raw_token, item["symbol"])
+        if raw_token == corrected_token:
+            continue
+        corrections.append(
+            {
+                "field": "math_content_corrected",
+                "symbol": base,
+                "original": raw_token,
+                "corrected": corrected_token,
+                "reason": f"公式符号 {raw_token} 与参数符号 {item['symbol']} 不一致",
+            }
+        )
+    return corrections
+
+
+def _should_write_llm_correction(node: Dict[str, Any]) -> bool:
+    """用户已修正（corrected_by == "user"）时，semantic 不再覆盖。"""
+    return str(node.get("corrected_by") or "").strip().lower() != "user"
+
+
+def _apply_symbol_replacements(
+    text: str,
+    corrections: List[Dict[str, Any]],
+) -> str:
+    result = str(text or "")
+    for corr in corrections:
+        original = corr.get("original")
+        corrected = corr.get("corrected")
+        if original and corrected and original in result:
+            result = result.replace(original, corrected, 1)
+    return result
+
+
+# 生成公式结构化表示，供结构化索引层消费。
+def build_formula_representations(
+    formula_text: str,
+    explanation_lines: List[str],
+    llm_client: Optional["LLMClient"] = None,
+    llm_model: Optional[str] = None,
+    use_llm: bool = True,
+    llm_result: Optional[Tuple[List[Dict[str, Any]], str]] = None,
+) -> FormulaSemanticsContract:
+    cleaned_formula = clean_formula_text(formula_text)
+    normalized_lines = split_formula_explanation_lines(explanation_lines)
+    formula_number = extract_formula_number(cleaned_formula, normalized_lines)
+    formula_body = strip_formula_tag(cleaned_formula)
+
+    rule_params: List[Dict[str, Any]] = []
+    unmatched_lines: List[str] = []
+    for line in normalized_lines:
+        parsed = parse_formula_param_rule(line)
+        if parsed:
+            rule_params.append(parsed)
+        else:
+            unmatched_lines.append(line)
+
+    llm_params: List[Dict[str, Any]] = []
+    llm_status = "disabled"
+    if use_llm:
+        if not normalized_lines:
+            llm_status = "not_needed"
+        elif llm_result is not None:
+            llm_params, llm_status = llm_result
+        else:
+            llm_params, llm_status = llm_extract_formula_params(
+                formula_text=cleaned_formula,
+                explanation_lines=normalized_lines,
+                llm_client=llm_client,
+                llm_model=llm_model,
+            )
+
+    formula_params = merge_formula_params(rule_params, llm_params)
+    summary = cleaned_formula or "未命名公式"
+    if formula_number:
+        summary = f"公式({formula_number}) {summary}"
+    if formula_params:
+        symbols = ", ".join(item["symbol"] for item in formula_params[:8])
+        summary = f"{summary}；包含 {len(formula_params)} 个参数：{symbols}"
+
+    return {
+        "formula_text": cleaned_formula,
+        "formula_body": formula_body,
+        "formula_number": formula_number,
+        "formula_params": formula_params,
+        "formula_param_count": len(formula_params),
+        "formula_summary": summary,
+        "llm_status": llm_status,
+        "explanation_lines": normalized_lines,
+    }
+
+
+# 公式解释段的候选类型——**canonical 词汇**（BlockType），不是 MinerU 行词汇：
+# 本模块两条调用路（step05 canonical_builder.normalize_block_type、下方
+# _NODE_TYPE_ALIASES）都已把 `list`→`list_item`，CanonicalBlock 的 Literal 也
+# 直接拒绝 `list`。此处 `list_item` 已覆盖列表内容，勿再并入 ROW_TEXT_TYPES
+# （2026-09-20 词汇漂移排查曾误判此处为漂移点，见 docs/plan-popo-type-vocabulary.md）。
+_CANONICAL_EXPLANATION_TEXT_TYPES = frozenset({"paragraph", "list_item"})
+
+
+# 从公式块下文定位解释段（section_path + reading_order 邻近）。公式后紧跟的
+# 同节段落优先，可跨一页取邻近段。
+def _iter_canonical_explanation_blocks(
+    block: "CanonicalBlock",
+    following_blocks: Optional[List["CanonicalBlock"]] = None,
+    max_lines: int = 8,
+):
+    """?????????? (block, text) ??????? uid ?????"""
+    if block is None:
+        return
+    count = 0
+    for nb in following_blocks or []:
+        if count >= max_lines:
+            break
+        if nb.block_type == "formula":
+            continue
+        if nb.block_type not in _CANONICAL_EXPLANATION_TEXT_TYPES:
+            continue
+        same_section = (nb.section_path == block.section_path) or not nb.section_path
+        nearby = abs(int(nb.page_idx or 0) - int(block.page_idx or 0)) <= 1
+        if not (same_section and nearby):
+            continue
+        text = clean_formula_text(nb.text or nb.text_clean or "")
+        if not text:
+            continue
+        count += 1
+        yield nb, text
+
+
+def collect_canonical_explanation_lines(
+    block: "CanonicalBlock",
+    following_blocks: Optional[List["CanonicalBlock"]] = None,
+    max_lines: int = 8,
+) -> List[str]:
+    if block is None:
+        return []
+    return [text for _nb, text in _iter_canonical_explanation_blocks(block, following_blocks, max_lines)]
+
+
+def _collect_explanation_block_uids(
+    block: "CanonicalBlock",
+    following_blocks: Optional[List["CanonicalBlock"]] = None,
+    max_lines: int = 8,
+) -> List[str]:
+    """??????????? uid????? explanation_uids ? explanation_lines ???"""
+    return [nb.block_id for nb, _text in _iter_canonical_explanation_blocks(block, following_blocks, max_lines)]
+
+
+
+# 语义层后端无关入口：输入公式块（type=="formula"）及其下文解释段，产出
+# FormulaSemanticsContract，不依赖任何后端内部格式。
+def enrich_formula_block(
+    block: "CanonicalBlock",
+    blocks: Optional[List["CanonicalBlock"]] = None,
+    *,
+    llm_client: Optional["LLMClient"] = None,
+    llm_model: Optional[str] = None,
+    use_llm: bool = False,
+) -> FormulaSemanticsContract:
+    if block is None or block.block_type != "formula":
+        return {
+            "formula_text": "",
+            "formula_body": "",
+            "formula_number": None,
+            "formula_params": [],
+            "formula_param_count": 0,
+            "formula_summary": "",
+            "llm_status": "skipped",
+            "explanation_lines": [],
+        }
+    following: List["CanonicalBlock"] = []
+    if blocks:
+        ordered = sorted(blocks, key=lambda item: (item.page_idx, item.reading_order))
+        start = next(
+            (i for i, item in enumerate(ordered) if item.block_id == block.block_id),
+            None,
+        )
+        if start is not None:
+            following = ordered[start + 1:]
+    explanation_lines = collect_canonical_explanation_lines(block, following)
+    return build_formula_representations(
+        formula_text=block.text or block.text_clean or "",
+        explanation_lines=explanation_lines,
+        llm_client=llm_client,
+        llm_model=llm_model,
+        use_llm=use_llm,
+    )
+
+
+def enrich_blocks_formula_semantics(
+    blocks: List["CanonicalBlock"],
+    *,
+    use_llm: bool = False,
+    llm_client: Optional["LLMClient"] = None,
+    llm_model: Optional[str] = None,
+) -> List["CanonicalBlock"]:
+    """blocks 级公式语义增强：按 (page_idx, reading_order) 排序，仅 formula 块计算契约。"""
+    ordered = sorted(blocks, key=lambda item: (item.page_idx, item.reading_order))
+    contracts: dict[str, dict] = {}
+    for block in ordered:
+        if block.block_type == "formula":
+            contracts[block.block_id] = enrich_formula_block(
+                block,
+                ordered,
+                llm_client=llm_client,
+                llm_model=llm_model,
+                use_llm=use_llm,
+            )
+    return [
+        block.model_copy(update={"formula_semantics": contracts[block.block_id]})
+        if block.block_id in contracts
+        else block
+        for block in blocks
+    ]
+
+
+_NODE_TYPE_ALIASES = {
+    "equation": "formula",
+    "equation_interline": "formula",
+    "inline_formula": "formula",
+    "index": "toc",
+    "list": "list_item",
+}
+_CANONICAL_BLOCK_TYPES = {
+    "title", "paragraph", "list_item", "table", "table_caption", "figure",
+    "figure_caption", "header_footer", "footnote", "formula", "toc", "unknown",
+}
+
+
+def _node_to_canonical_block(node: Dict[str, Any]) -> CanonicalBlock:
+    block_type = _NODE_TYPE_ALIASES.get(
+        str(node.get("block_type") or ""), str(node.get("block_type") or "unknown")
+    )
+    if block_type not in _CANONICAL_BLOCK_TYPES:
+        block_type = "unknown"
+    return CanonicalBlock(
+        block_id=str(node.get("block_uid") or node.get("id") or ""),
+        doc_id="",
+        page_idx=int(node.get("page_idx") or 0),
+        block_type=block_type,
+        text=str(node.get("math_content") or node.get("plain_text") or ""),
+        text_clean=str(node.get("plain_text") or ""),
+        reading_order=int(node.get("block_seq") or 0),
+        section_path=str(node.get("title_path") or ""),
+    )
+
+
+def _resolve_explanation_lines(
+    node: Dict[str, Any],
+    block: CanonicalBlock,
+    ordered: List[CanonicalBlock],
+    nodes_by_uid: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    linked = node.get("explanation_uids")
+    idx = ordered.index(block)
+    rederived = collect_canonical_explanation_lines(block, ordered[idx + 1:])
+    if not isinstance(linked, list) or not linked:
+        return rederived
+    linked_lines: List[str] = []
+    for uid in linked:
+        text = str(nodes_by_uid.get(str(uid), {}).get("plain_text") or "").strip()
+        if text:
+            linked_lines.append(text)
+    # 并集：04 现场关联优先，重定位补充（避免关联不完整反而减少上下文）
+    seen = set(linked_lines)
+    merged = list(linked_lines)
+    for line in rederived:
+        if line not in seen:
+            merged.append(line)
+            seen.add(line)
+    return merged
+
+
+def enrich_graph_nodes_formula_semantics(
+    nodes: List[Dict[str, Any]],
+    *,
+    use_llm: bool = False,
+    llm_client: Optional["LLMClient"] = None,
+    llm_model: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """04 建块后、落 jsonl 前调用：给公式节点计算并写入 formula_semantics。
+
+    解释段优先读节点 ``explanation_uids``（solo_engine 公式组关联产出），
+    缺失时回退到 section_path+邻近重定位。
+    """
+    stats: Dict[str, Any] = {
+        "total_formulas": 0,
+        "enriched": 0,
+        "llm_status": "disabled",
+        "symbol_corrections": 0,
+    }
+    if not nodes:
+        return nodes, stats
+
+    nodes_by_uid = {str(n.get("block_uid") or n.get("id") or ""): n for n in nodes}
+    blocks = [_node_to_canonical_block(n) for n in nodes]
+    ordered = sorted(blocks, key=lambda b: (b.page_idx, b.reading_order))
+    formula_blocks = [b for b in ordered if b.block_type == "formula"]
+    stats["total_formulas"] = len(formula_blocks)
+    if not formula_blocks:
+        return nodes, stats
+
+    updated = [dict(n) for n in nodes]
+    updated_by_uid = {str(n.get("block_uid") or n.get("id") or ""): n for n in updated}
+    block_by_uid = {b.block_id: b for b in ordered}
+    statuses: List[str] = []
+
+    # 批量 LLM 提取：默认 3 个/批 + 整批失败重试一次 + 拆半兜底，减少串行调用
+    formula_lines: Dict[str, List[str]] = {}
+    llm_results: Dict[str, Tuple[List[Dict[str, Any]], str]] = {}
+    if use_llm and llm_client:
+        batch_items: List[Dict[str, Any]] = []
+        for block in formula_blocks:
+            node = nodes_by_uid.get(block.block_id) or {}
+            lines = _resolve_explanation_lines(node, block, ordered, nodes_by_uid)
+            formula_lines[block.block_id] = lines
+            batch_items.append(
+                {
+                    "key": block.block_id,
+                    "formula_text": block.text or "",
+                    "explanation_lines": lines,
+                }
+            )
+        llm_results = llm_extract_formula_params_batch(batch_items, llm_client, llm_model)
+
+    for block in formula_blocks:
+        node = nodes_by_uid.get(block.block_id) or {}
+        explanation_lines = formula_lines.get(block.block_id)
+        if explanation_lines is None:
+            explanation_lines = _resolve_explanation_lines(node, block, ordered, nodes_by_uid)
+        contract = build_formula_representations(
+            formula_text=block.text,
+            explanation_lines=explanation_lines,
+            llm_client=llm_client,
+            llm_model=llm_model,
+            use_llm=use_llm,
+            llm_result=llm_results.get(block.block_id),
+        )
+        corrections = _build_symbol_corrections(
+            block.text,
+            contract.get("formula_params") or [],
+        )
+        if corrections and _should_write_llm_correction(node):
+            corrected_math = _apply_symbol_replacements(block.text, corrections)
+            updated_by_uid[block.block_id]["math_content_corrected"] = corrected_math
+            raw_plain = str(node.get("plain_text") or "")
+            if raw_plain.strip():
+                corrected_plain = _apply_symbol_replacements(raw_plain, corrections)
+                if corrected_plain != raw_plain:
+                    updated_by_uid[block.block_id]["plain_text_corrected"] = corrected_plain
+            updated_by_uid[block.block_id]["symbol_mismatch"] = True
+            updated_by_uid[block.block_id]["corrected_by"] = "llm"
+            updated_by_uid[block.block_id]["corrected_at"] = datetime.now().isoformat()
+            stats["symbol_corrections"] += 1
+        updated_by_uid[block.block_id]["formula_semantics"] = contract
+        # 回写 explanation_uids：04 现场关联 + 重定位并集，保证前端联动与语义内容一致
+        idx = ordered.index(block)
+        linked_uids = [str(u) for u in (node.get("explanation_uids") or []) if str(u)]
+        rederived_uids = _collect_explanation_block_uids(block, ordered[idx + 1:])
+        merged_uids: List[str] = []
+        for uid in linked_uids + rederived_uids:
+            if uid not in merged_uids:
+                merged_uids.append(uid)
+        updated_by_uid[block.block_id]["explanation_uids"] = merged_uids or None
+        statuses.append(str(contract.get("llm_status") or "disabled"))
+        stats["enriched"] += 1
+
+    if statuses:
+        if any(s == "ok" for s in statuses):
+            stats["llm_status"] = "ok"
+        elif all(s == "not_needed" for s in statuses):
+            stats["llm_status"] = "not_needed"
+    return updated, stats
+
+
+__all__ = [
+    "FormulaParamContract",
+    "FormulaSemanticsContract",
+    "build_formula_representations",
+    "clean_formula_text",
+    "collect_canonical_explanation_lines",
+    "enrich_blocks_formula_semantics",
+    "enrich_formula_block",
+    "enrich_graph_nodes_formula_semantics",
+    "extract_formula_number",
+    "extract_formula_reference_hint",
+    "extract_formula_unit",
+    "llm_extract_formula_params",
+    "llm_extract_formula_params_batch",
+    "merge_formula_params",
+    "parse_formula_llm_json",
+    "parse_formula_param_rule",
+    "split_formula_explanation_lines",
+    "strip_formula_tag",
+]

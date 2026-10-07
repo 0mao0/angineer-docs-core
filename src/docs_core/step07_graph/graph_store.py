@@ -1,0 +1,1182 @@
+import json
+import sqlite3
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from docs_core.step07_graph.config import Confidence, EntityLayer, EntityStatus, RelationType
+
+
+def _generate_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _serialize_aliases(aliases: List[str]) -> str:
+    return json.dumps(aliases, ensure_ascii=False)
+
+
+def _deserialize_aliases(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    return json.loads(raw)
+
+
+# graph_entities 建表语句（含 library_id 多库隔离；UNIQUE(name) 已演进为 UNIQUE(name, library_id)）
+_ENTITIES_TABLE_SQL = """
+                CREATE TABLE IF NOT EXISTS graph_entities (
+                    entity_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    layer TEXT NOT NULL CHECK(layer IN ('concept','condition','action')),
+                    aliases_json TEXT DEFAULT '[]',
+                    description TEXT DEFAULT '',
+                    source_doc TEXT DEFAULT '',
+                    source_clause TEXT DEFAULT '',
+                    library_id TEXT NOT NULL DEFAULT 'default',
+                    status TEXT NOT NULL DEFAULT 'approved',
+                    proposed_doc_id TEXT DEFAULT '',
+                    proposed_by TEXT DEFAULT '',
+                    reject_reason TEXT DEFAULT '',
+                    reviewed_at TEXT DEFAULT '',
+                    reviewed_by TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(name, library_id)
+                );
+"""
+
+
+@dataclass
+class PrincipleData:
+    principle_id: str = field(default_factory=_generate_id)
+    principle_text: str = ""
+    category: str = ""
+    source_clause: str = ""
+    evidence_quote: str = ""
+    library_id: str = ""
+    doc_id: str = ""
+    created_at: str = field(default_factory=_now)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "PrincipleData":
+        return cls(
+            principle_id=row["principle_id"],
+            principle_text=row["principle_text"],
+            category=row["category"],
+            source_clause=row["source_clause"],
+            evidence_quote=row["evidence_quote"],
+            library_id=row["library_id"],
+            doc_id=row["doc_id"],
+            created_at=row["created_at"],
+        )
+
+
+@dataclass
+class Example:
+    example_id: str = field(default_factory=_generate_id)
+    title: str = ""
+    inputs_json: str = "{}"
+    computation_text: str = ""
+    source_section: str = ""
+    library_id: str = ""
+    doc_id: str = ""
+    created_at: str = field(default_factory=_now)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Example":
+        return cls(
+            example_id=row["example_id"],
+            title=row["title"],
+            inputs_json=row["inputs_json"],
+            computation_text=row["computation_text"],
+            source_section=row["source_section"],
+            library_id=row["library_id"],
+            doc_id=row["doc_id"],
+            created_at=row["created_at"],
+        )
+
+
+@dataclass
+class WarningItem:
+    warning_id: str = field(default_factory=_generate_id)
+    warning_text: str = ""
+    category: str = ""
+    severity: str = ""
+    source_section: str = ""
+    library_id: str = ""
+    doc_id: str = ""
+    created_at: str = field(default_factory=_now)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "PrincipleData":
+        return cls(
+            principle_id=row["principle_id"],
+            principle_text=row["principle_text"],
+            category=row["category"],
+            source_clause=row["source_clause"],
+            evidence_quote=row["evidence_quote"],
+            library_id=row["library_id"],
+            doc_id=row["doc_id"],
+            created_at=row["created_at"],
+        )
+
+
+@dataclass
+class Framework:
+    framework_id: str = field(default_factory=_generate_id)
+    name: str = ""
+    steps_json: str = "[]"
+    entry_condition: str = ""
+    source_section: str = ""
+    entity_path: str = "[]"
+    library_id: str = ""
+    doc_id: str = ""
+    created_at: str = field(default_factory=_now)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Framework":
+        return cls(
+            framework_id=row["framework_id"],
+            name=row["name"],
+            steps_json=row["steps_json"],
+            entry_condition=row["entry_condition"],
+            source_section=row["source_section"],
+            entity_path=row["entity_path"],
+            library_id=row["library_id"],
+            doc_id=row["doc_id"],
+            created_at=row["created_at"],
+        )
+
+
+@dataclass
+class GraphEntity:
+    name: str
+    layer: EntityLayer
+    entity_id: str = field(default_factory=_generate_id)
+    aliases: List[str] = field(default_factory=list)
+    description: str = ""
+    source_doc: str = ""
+    source_clause: str = ""
+    library_id: str = "default"
+    status: EntityStatus = EntityStatus.APPROVED
+    proposed_doc_id: str = ""
+    proposed_by: str = ""
+    reject_reason: str = ""
+    reviewed_at: str = ""
+    reviewed_by: str = ""
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "GraphEntity":
+        return cls(
+            entity_id=row["entity_id"],
+            name=row["name"],
+            layer=EntityLayer(row["layer"]),
+            aliases=_deserialize_aliases(row["aliases_json"]),
+            description=row["description"],
+            source_doc=row["source_doc"],
+            source_clause=row["source_clause"],
+            library_id=row["library_id"],
+            status=EntityStatus(row["status"]),
+            proposed_doc_id=row["proposed_doc_id"],
+            proposed_by=row["proposed_by"],
+            reject_reason=row["reject_reason"],
+            reviewed_at=row["reviewed_at"],
+            reviewed_by=row["reviewed_by"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+@dataclass
+class GraphRelation:
+    source_id: str
+    target_id: str
+    relation_type: RelationType
+    relation_id: str = field(default_factory=_generate_id)
+    confidence: float = 0.3
+    evidence_text: str = ""
+    source_clause: str = ""
+    conflict_note: str = ""
+    library_id: str = ""
+    doc_id: str = ""
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "GraphRelation":
+        return cls(
+            relation_id=row["relation_id"],
+            source_id=row["source_id"],
+            target_id=row["target_id"],
+            relation_type=RelationType(row["relation_type"]),
+            confidence=row["confidence"],
+            evidence_text=row["evidence_text"],
+            source_clause=row["source_clause"],
+            conflict_note=row["conflict_note"],
+            library_id=row["library_id"],
+            doc_id=row["doc_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+class GraphStore:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def close(self):
+        pass
+
+    def _init_schema(self):
+        with self._connect() as conn:
+            # 旧表迁移：graph_entities 无 library_id → 按 new-table 策略重建
+            # （CREATE new → INSERT → DROP 旧 → RENAME new）。不 rename 主表，
+            # 避免引用表（relations/联结表）的 REFERENCES 文本被 SQLite 改写绑到旧表。
+            existing = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='graph_entities'"
+            ).fetchone()
+            new_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='graph_entities_new'"
+            ).fetchone()
+            needs_migration = False
+            if existing is not None:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(graph_entities)")]
+                needs_migration = "library_id" not in cols
+            if needs_migration or new_exists is not None:
+                conn.execute("PRAGMA foreign_keys=OFF")
+                conn.execute("PRAGMA legacy_alter_table=ON")
+                try:
+                    conn.execute(_ENTITIES_TABLE_SQL.replace("graph_entities", "graph_entities_new", 1))
+                    if existing is not None and needs_migration:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO graph_entities_new
+                                (entity_id, name, layer, aliases_json, description, source_doc, source_clause, library_id,
+                                 status, proposed_doc_id, proposed_by, reject_reason, reviewed_at, reviewed_by, created_at, updated_at)
+                            SELECT entity_id, name, layer, aliases_json, description, source_doc, source_clause, 'default',
+                                 'approved', '', '', '', '', '', created_at, updated_at
+                            FROM graph_entities
+                        """)
+                        conn.execute("DROP TABLE graph_entities")
+                    conn.execute("ALTER TABLE graph_entities_new RENAME TO graph_entities")
+                finally:
+                    conn.execute("PRAGMA legacy_alter_table=OFF")
+                    conn.execute("PRAGMA foreign_keys=ON")
+            entity_cols = [r[1] for r in conn.execute("PRAGMA table_info(graph_entities)")]
+            for col_name, ddl in (
+                ("status", "status TEXT NOT NULL DEFAULT 'approved'"),
+                ("proposed_doc_id", "proposed_doc_id TEXT DEFAULT ''"),
+                ("proposed_by", "proposed_by TEXT DEFAULT ''"),
+                ("reject_reason", "reject_reason TEXT DEFAULT ''"),
+                ("reviewed_at", "reviewed_at TEXT DEFAULT ''"),
+                ("reviewed_by", "reviewed_by TEXT DEFAULT ''"),
+            ):
+                if entity_cols and col_name not in entity_cols:
+                    conn.execute(f"ALTER TABLE graph_entities ADD COLUMN {ddl}")
+            conn.executescript(_ENTITIES_TABLE_SQL + """
+                CREATE TABLE IF NOT EXISTS graph_relations (
+                    relation_id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES graph_entities(entity_id),
+                    target_id TEXT NOT NULL REFERENCES graph_entities(entity_id),
+                    relation_type TEXT NOT NULL CHECK(relation_type IN ('defines','requires','constrains','conditions_on','computes_from','verifies')),
+                    confidence REAL NOT NULL DEFAULT 0.3,
+                    evidence_text TEXT DEFAULT '',
+                    source_clause TEXT DEFAULT '',
+                    conflict_note TEXT DEFAULT '',
+                    library_id TEXT DEFAULT '',
+                    doc_id TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_id, target_id, relation_type, library_id, doc_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_entities_name ON graph_entities(name);
+                CREATE INDEX IF NOT EXISTS idx_entities_layer ON graph_entities(layer);
+                CREATE INDEX IF NOT EXISTS idx_entities_status ON graph_entities(library_id, status);
+                CREATE INDEX IF NOT EXISTS idx_entities_proposed_doc ON graph_entities(library_id, proposed_doc_id);
+                CREATE INDEX IF NOT EXISTS idx_relations_source ON graph_relations(source_id);
+                CREATE INDEX IF NOT EXISTS idx_relations_target ON graph_relations(target_id);
+                CREATE INDEX IF NOT EXISTS idx_relations_type ON graph_relations(relation_type);
+                CREATE INDEX IF NOT EXISTS idx_relations_doc ON graph_relations(library_id, doc_id);
+
+                CREATE TABLE IF NOT EXISTS graph_principles (
+                    principle_id TEXT PRIMARY KEY,
+                    principle_text TEXT NOT NULL,
+                    category TEXT DEFAULT 'mandatory',
+                    source_clause TEXT DEFAULT '',
+                    evidence_quote TEXT DEFAULT '',
+                    library_id TEXT DEFAULT '',
+                    doc_id TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS principle_entities (
+                    principle_id TEXT NOT NULL REFERENCES graph_principles(principle_id),
+                    entity_id TEXT NOT NULL REFERENCES graph_entities(entity_id),
+                    UNIQUE(principle_id, entity_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_examples (
+                    example_id TEXT PRIMARY KEY,
+                    title TEXT DEFAULT '',
+                    inputs_json TEXT DEFAULT '{}',
+                    computation_text TEXT DEFAULT '',
+                    source_section TEXT DEFAULT '',
+                    library_id TEXT DEFAULT '',
+                    doc_id TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS example_entities (
+                    example_id TEXT NOT NULL REFERENCES graph_examples(example_id),
+                    entity_id TEXT NOT NULL REFERENCES graph_entities(entity_id),
+                    UNIQUE(example_id, entity_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_warnings (
+                    warning_id TEXT PRIMARY KEY,
+                    warning_text TEXT NOT NULL,
+                    category TEXT DEFAULT '',
+                    severity TEXT DEFAULT 'quality',
+                    source_section TEXT DEFAULT '',
+                    library_id TEXT DEFAULT '',
+                    doc_id TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS warning_entities (
+                    warning_id TEXT NOT NULL REFERENCES graph_warnings(warning_id),
+                    entity_id TEXT NOT NULL REFERENCES graph_entities(entity_id),
+                    UNIQUE(warning_id, entity_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_frameworks (
+                    framework_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    steps_json TEXT DEFAULT '[]',
+                    entry_condition TEXT DEFAULT '',
+                    source_section TEXT DEFAULT '',
+                    entity_path TEXT DEFAULT '[]',
+                    library_id TEXT DEFAULT '',
+                    doc_id TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS graph_entity_deletions (
+                    library_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL,
+                    PRIMARY KEY(library_id, name)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_principles_doc ON graph_principles(library_id, doc_id);
+                CREATE INDEX IF NOT EXISTS idx_examples_doc ON graph_examples(library_id, doc_id);
+                CREATE INDEX IF NOT EXISTS idx_warnings_doc ON graph_warnings(library_id, doc_id);
+                CREATE INDEX IF NOT EXISTS idx_frameworks_doc ON graph_frameworks(library_id, doc_id);
+            """)
+
+    def delete_document(self, doc_id: str) -> int:
+        """删除指定文档的图谱产物（doc 级行与关联表）。
+
+        graph_entities 为全局共享实体（按 name 唯一、可跨文档引用），不随单文档删除。
+        """
+        removed = 0
+        with self._connect() as conn:
+            for junction, id_col, parent in (
+                ("principle_entities", "principle_id", "graph_principles"),
+                ("example_entities", "example_id", "graph_examples"),
+                ("warning_entities", "warning_id", "graph_warnings"),
+            ):
+                cursor = conn.execute(
+                    f"DELETE FROM {junction} WHERE {id_col} IN "
+                    f"(SELECT {id_col} FROM {parent} WHERE doc_id = ?)",
+                    (doc_id,),
+                )
+                removed += int(cursor.rowcount or 0)
+            for table in (
+                "graph_relations",
+                "graph_principles",
+                "graph_examples",
+                "graph_warnings",
+                "graph_frameworks",
+            ):
+                cursor = conn.execute(f"DELETE FROM {table} WHERE doc_id = ?", (doc_id,))
+                removed += int(cursor.rowcount or 0)
+            conn.commit()
+        return removed
+
+    def delete_library(self, library_id: str) -> int:
+        """删除指定知识库的全部图谱产物（relations + 库级附属表 + 实体）。
+
+        实体在库删除场景下属于该库的提取工作成果，一并清除；要求调用方确认范围内无跨库共享需求。
+        """
+        removed = 0
+        with self._connect() as conn:
+            for junction, id_col, parent in (
+                ("principle_entities", "principle_id", "graph_principles"),
+                ("example_entities", "example_id", "graph_examples"),
+                ("warning_entities", "warning_id", "graph_warnings"),
+            ):
+                cursor = conn.execute(
+                    f"DELETE FROM {junction} WHERE {id_col} IN "
+                    f"(SELECT {id_col} FROM {parent} WHERE library_id = ?)",
+                    (library_id,),
+                )
+                removed += int(cursor.rowcount or 0)
+            for table in (
+                "graph_relations",
+                "graph_principles",
+                "graph_examples",
+                "graph_warnings",
+                "graph_frameworks",
+            ):
+                cursor = conn.execute(f"DELETE FROM {table} WHERE library_id = ?", (library_id,))
+                removed += int(cursor.rowcount or 0)
+            cursor = conn.execute(
+                "DELETE FROM graph_entities WHERE library_id = ?", (library_id,)
+            )
+            removed += int(cursor.rowcount or 0)
+            conn.commit()
+        return removed
+
+    def upsert_entity(self, entity: GraphEntity) -> GraphEntity:
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM graph_entities WHERE name = ? AND library_id = ?",
+                (entity.name, entity.library_id),
+            ).fetchone()
+            if row:
+                existing = GraphEntity.from_row(row)
+                merged_aliases = list(set(existing.aliases + entity.aliases))
+                entity.entity_id = existing.entity_id
+                entity.created_at = existing.created_at
+                entity.updated_at = now
+                entity.aliases = merged_aliases
+                conn.execute(
+                    """UPDATE graph_entities SET
+                        layer=?, aliases_json=?, description=?,
+                        source_doc=?, source_clause=?, updated_at=?
+                    WHERE entity_id=?""",
+                    (
+                        entity.layer.value,
+                        _serialize_aliases(merged_aliases),
+                        entity.description,
+                        entity.source_doc,
+                        entity.source_clause,
+                        now,
+                        existing.entity_id,
+                    ),
+                )
+            else:
+                entity.entity_id = entity.entity_id or _generate_id()
+                entity.created_at = now
+                entity.updated_at = now
+                conn.execute(
+                    """INSERT INTO graph_entities
+                        (entity_id, name, layer, aliases_json, description, source_doc, source_clause, library_id,
+                         status, proposed_doc_id, proposed_by, reject_reason, reviewed_at, reviewed_by, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        entity.entity_id,
+                        entity.name,
+                        entity.layer.value,
+                        _serialize_aliases(entity.aliases),
+                        entity.description,
+                        entity.source_doc,
+                        entity.source_clause,
+                        entity.library_id,
+                        entity.status.value,
+                        entity.proposed_doc_id,
+                        entity.proposed_by,
+                        entity.reject_reason,
+                        entity.reviewed_at,
+                        entity.reviewed_by,
+                        now,
+                        now,
+                    ),
+                )
+        return entity
+
+    def get_entity_by_name(self, name: str, library_id: Optional[str] = None) -> Optional[GraphEntity]:
+        with self._connect() as conn:
+            if library_id is not None:
+                row = conn.execute(
+                    "SELECT * FROM graph_entities WHERE name = ? AND library_id = ?",
+                    (name, library_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM graph_entities WHERE name = ?", (name,)
+                ).fetchone()
+            if row is None:
+                return None
+            return GraphEntity.from_row(row)
+
+    def get_entity(self, entity_id: str) -> Optional[GraphEntity]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM graph_entities WHERE entity_id = ?", (entity_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return GraphEntity.from_row(row)
+
+    def search_entities(self, query: str, limit: int = 20, library_id: Optional[str] = None,
+                        status: Optional[EntityStatus] = None) -> List[GraphEntity]:
+        clauses = ["(name LIKE ? OR aliases_json LIKE ?)"]
+        args: List[Any] = [f"%{query}%", f"%{query}%"]
+        if library_id is not None:
+            clauses.append("library_id = ?")
+            args.append(library_id)
+        if status is not None:
+            clauses.append("status = ?")
+            args.append(status.value)
+        where = " AND ".join(clauses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM graph_entities WHERE {where} LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+            return [GraphEntity.from_row(r) for r in rows]
+
+    def list_entities_by_layer(self, layer: EntityLayer) -> List[GraphEntity]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM graph_entities WHERE layer = ?", (layer.value,)
+            ).fetchall()
+            return [GraphEntity.from_row(r) for r in rows]
+
+    def list_entities_by_status(self, library_id: str, status: EntityStatus) -> List[GraphEntity]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM graph_entities WHERE library_id=? AND status=? ORDER BY created_at DESC",
+                (library_id, status.value),
+            ).fetchall()
+            return [GraphEntity.from_row(r) for r in rows]
+
+    def list_library_entities(self, library_id: str) -> List[GraphEntity]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM graph_entities WHERE library_id=? ORDER BY created_at DESC",
+                (library_id,),
+            ).fetchall()
+            return [GraphEntity.from_row(r) for r in rows]
+
+    def list_all_entities(self) -> List[GraphEntity]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM graph_entities").fetchall()
+            return [GraphEntity.from_row(r) for r in rows]
+
+    def add_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: RelationType,
+        confidence: float = 0.3,
+        evidence_text: str = "",
+        source_clause: str = "",
+        library_id: str = "",
+        doc_id: str = "",
+    ) -> GraphRelation:
+        now = _now()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM graph_relations WHERE source_id=? AND target_id=? AND relation_type=? AND library_id=? AND doc_id=?",
+                (source_id, target_id, relation_type.value, library_id, doc_id),
+            ).fetchone()
+            if row:
+                existing = GraphRelation.from_row(row)
+                new_confidence = max(existing.confidence, confidence)
+                merged_evidence = existing.evidence_text
+                if evidence_text and evidence_text != merged_evidence:
+                    merged_evidence = evidence_text
+                merged_clause = existing.source_clause
+                if source_clause and source_clause != merged_clause:
+                    merged_clause = source_clause
+                conn.execute(
+                    """UPDATE graph_relations SET
+                        confidence=?, evidence_text=?, source_clause=?, updated_at=?
+                    WHERE relation_id=?""",
+                    (new_confidence, merged_evidence, merged_clause, now, existing.relation_id),
+                )
+                existing.confidence = new_confidence
+                existing.evidence_text = merged_evidence
+                existing.source_clause = merged_clause
+                existing.updated_at = now
+                return existing
+            else:
+                relation_id = _generate_id()
+                conn.execute(
+                    """INSERT INTO graph_relations
+                        (relation_id, source_id, target_id, relation_type, confidence, evidence_text, source_clause, library_id, doc_id, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        relation_id,
+                        source_id,
+                        target_id,
+                        relation_type.value,
+                        confidence,
+                        evidence_text,
+                        source_clause,
+                        library_id,
+                        doc_id,
+                        now,
+                        now,
+                    ),
+                )
+                return GraphRelation(
+                    relation_id=relation_id,
+                    source_id=source_id,
+                    target_id=target_id,
+                    relation_type=relation_type,
+                    confidence=confidence,
+                    evidence_text=evidence_text,
+                    source_clause=source_clause,
+                    library_id=library_id,
+                    doc_id=doc_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+
+    def _get_relation_by_triple(
+        self, source_id: str, target_id: str, relation_type: RelationType
+    ) -> Optional[GraphRelation]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM graph_relations WHERE source_id=? AND target_id=? AND relation_type=?",
+                (source_id, target_id, relation_type.value),
+            ).fetchone()
+            if row is None:
+                return None
+            return GraphRelation.from_row(row)
+
+    def get_relation(self, relation_id: str) -> Optional[GraphRelation]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM graph_relations WHERE relation_id = ?", (relation_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return GraphRelation.from_row(row)
+
+    def get_relations_by_entity(
+        self, entity_id: str, direction: str = "both"
+    ) -> List[GraphRelation]:
+        with self._connect() as conn:
+            if direction == "outgoing":
+                rows = conn.execute(
+                    "SELECT * FROM graph_relations WHERE source_id = ?", (entity_id,)
+                ).fetchall()
+            elif direction == "incoming":
+                rows = conn.execute(
+                    "SELECT * FROM graph_relations WHERE target_id = ?", (entity_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM graph_relations WHERE source_id = ? OR target_id = ?",
+                    (entity_id, entity_id),
+                ).fetchall()
+            return [GraphRelation.from_row(r) for r in rows]
+
+    def get_relations_by_doc(self, library_id: str, doc_id: str) -> List[GraphRelation]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM graph_relations WHERE library_id=? AND doc_id=?",
+                (library_id, doc_id),
+            ).fetchall()
+            return [GraphRelation.from_row(r) for r in rows]
+
+    def list_entities_by_doc(self, library_id: str, doc_id: str) -> List[GraphEntity]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT e.* FROM graph_entities e
+                   JOIN graph_relations r ON (e.entity_id = r.source_id OR e.entity_id = r.target_id)
+                   WHERE r.library_id=? AND r.doc_id=? AND e.status != 'rejected'""",
+                (library_id, doc_id),
+            ).fetchall()
+            return [GraphEntity.from_row(r) for r in rows]
+
+    def upsert_entity_by_name(
+        self, name: str, layer: str, source_doc: str = "", source_clause: str = "",
+        description: str = "", aliases: Optional[List[str]] = None, library_id: str = "default",
+    ) -> GraphEntity:
+        entity = GraphEntity(
+            name=name,
+            layer=EntityLayer(layer) if isinstance(layer, str) else layer,
+            source_doc=source_doc,
+            source_clause=source_clause,
+            description=description,
+            aliases=aliases or [],
+            library_id=library_id,
+        )
+        return self.upsert_entity(entity)
+
+    def add_relation_by_names(
+        self, source_name: str, target_name: str, relation_type: RelationType,
+        confidence: float = 0.3, evidence_text: str = "", source_clause: str = "",
+        library_id: str = "", doc_id: str = "",
+    ) -> Optional[GraphRelation]:
+        src = self.get_entity_by_name(source_name)
+        tgt = self.get_entity_by_name(target_name)
+        if src and tgt:
+            return self.add_relation(
+                source_id=src.entity_id, target_id=tgt.entity_id,
+                relation_type=relation_type, confidence=confidence,
+                evidence_text=evidence_text, source_clause=source_clause,
+                library_id=library_id, doc_id=doc_id,
+            )
+        return None
+
+    def mark_relation_conflict(self, relation_id: str, note: str) -> None:
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE graph_relations SET confidence=?, conflict_note=?, updated_at=?
+                WHERE relation_id=?""",
+                (Confidence.CONFLICT, note, now, relation_id),
+            )
+
+    def add_framework(self, name: str, steps_json: str, entry_condition: str, source_section: str,
+                      entity_path: List[str], library_id: str, doc_id: str) -> str:
+        fw_id = _generate_id()
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO graph_frameworks
+                   (framework_id, name, steps_json, entry_condition, source_section, entity_path, library_id, doc_id, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (fw_id, name, steps_json, entry_condition, source_section,
+                 json.dumps(entity_path, ensure_ascii=False), library_id, doc_id, now),
+            )
+        return fw_id
+
+    def get_frameworks_by_doc(self, library_id: str, doc_id: str) -> List[Framework]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM graph_frameworks WHERE library_id=? AND doc_id=?",
+                (library_id, doc_id),
+            ).fetchall()
+        return [Framework.from_row(r) for r in rows]
+
+    def add_principle(self, principle_text: str, category: str, entity_names: List[str],
+                      source_clause: str, evidence_quote: str, library_id: str, doc_id: str) -> str:
+        pr_id = _generate_id()
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO graph_principles
+                   (principle_id, principle_text, category, source_clause, evidence_quote, library_id, doc_id, created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (pr_id, principle_text, category[:50], source_clause, evidence_quote, library_id, doc_id, now),
+            )
+            for name in entity_names:
+                entity = conn.execute("SELECT entity_id FROM graph_entities WHERE name=?", (name,)).fetchone()
+                if entity:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO principle_entities (principle_id, entity_id) VALUES (?,?)",
+                        (pr_id, entity["entity_id"]),
+                    )
+        return pr_id
+
+    def get_principles_by_entity_ids(self, entity_ids: List[str]) -> List[PrincipleData]:
+        if not entity_ids:
+            return []
+        placeholders = ",".join("?" * len(entity_ids))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT DISTINCT p.* FROM graph_principles p
+                    JOIN principle_entities pe ON p.principle_id = pe.principle_id
+                    WHERE pe.entity_id IN ({placeholders})""",
+                entity_ids,
+            ).fetchall()
+        return [PrincipleData.from_row(r) for r in rows]
+
+    def add_example(self, title: str, inputs_json: str, computation_text: str,
+                    entity_names: List[str], source_section: str, library_id: str, doc_id: str) -> str:
+        ex_id = _generate_id()
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO graph_examples
+                   (example_id, title, inputs_json, computation_text, source_section, library_id, doc_id, created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (ex_id, title, inputs_json, computation_text, source_section, library_id, doc_id, now),
+            )
+            for name in entity_names:
+                entity_id = conn.execute("SELECT entity_id FROM graph_entities WHERE name=?", (name,)).fetchone()
+                if entity_id:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO example_entities (example_id, entity_id) VALUES (?,?)",
+                        (ex_id, entity_id["entity_id"]),
+                    )
+        return ex_id
+
+    def get_examples_by_entity_ids(self, entity_ids: List[str]) -> List[Example]:
+        if not entity_ids:
+            return []
+        placeholders = ",".join("?" * len(entity_ids))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT DISTINCT e.* FROM graph_examples e
+                    JOIN example_entities ee ON e.example_id = ee.example_id
+                    WHERE ee.entity_id IN ({placeholders})""",
+                entity_ids,
+            ).fetchall()
+        return [Example.from_row(r) for r in rows]
+
+    def add_warning(self, warning_text: str, category: str, severity: str,
+                    entity_names: List[str], source_section: str, library_id: str, doc_id: str) -> str:
+        w_id = _generate_id()
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO graph_warnings
+                   (warning_id, warning_text, category, severity, source_section, library_id, doc_id, created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (w_id, warning_text, category[:50], severity[:50], source_section, library_id, doc_id, now),
+            )
+            for name in entity_names:
+                entity_id = conn.execute("SELECT entity_id FROM graph_entities WHERE name=?", (name,)).fetchone()
+                if entity_id:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO warning_entities (warning_id, entity_id) VALUES (?,?)",
+                        (w_id, entity_id["entity_id"]),
+                    )
+        return w_id
+
+    def get_warnings_by_entity_ids(self, entity_ids: List[str]) -> List[WarningItem]:
+        if not entity_ids:
+            return []
+        placeholders = ",".join("?" * len(entity_ids))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT DISTINCT w.* FROM graph_warnings w
+                    JOIN warning_entities we ON w.warning_id = we.warning_id
+                    WHERE we.entity_id IN ({placeholders})""",
+                entity_ids,
+            ).fetchall()
+        return [WarningItem.from_row(r) for r in rows]
+
+    def update_entity_glossary(self, term: str, definition: str, aliases: List[str], source_section: str) -> None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM graph_entities WHERE name=?", (term,)).fetchone()
+            if row:
+                existing = GraphEntity.from_row(row)
+                merged_aliases = list(set(existing.aliases + aliases))
+                new_desc = existing.description
+                note = f"[{source_section}] {definition}"
+                if note not in new_desc:
+                    new_desc = (new_desc + "\n" + note).strip()
+                conn.execute(
+                    """UPDATE graph_entities SET description=?, aliases_json=?, updated_at=?
+                    WHERE entity_id=?""",
+                    (new_desc, _serialize_aliases(merged_aliases), _now(), existing.entity_id),
+                )
+
+    def approve_entity(self, entity_id: str, reviewer: str = "") -> bool:
+        now = _now()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE graph_entities SET status='approved', reviewed_at=?, reviewed_by=?, reject_reason=''
+                   WHERE entity_id=?""",
+                (now, reviewer, entity_id),
+            )
+            return int(cur.rowcount or 0) > 0
+
+    def reject_entity(self, entity_id: str, reason: str, reviewer: str = "") -> bool:
+        now = _now()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE graph_entities SET status='rejected', reviewed_at=?, reviewed_by=?, reject_reason=?
+                   WHERE entity_id=?""",
+                (now, reviewer, reason, entity_id),
+            )
+            return int(cur.rowcount or 0) > 0
+
+    def get_docs_referencing_entity(self, entity_id: str) -> List[tuple]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT library_id, doc_id FROM graph_relations
+                   WHERE (source_id=? OR target_id=?) AND library_id != '' AND doc_id != ''""",
+                (entity_id, entity_id),
+            ).fetchall()
+            return [(r["library_id"], r["doc_id"]) for r in rows]
+
+    def delete_relations_for_entity(self, entity_id: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM graph_relations WHERE source_id=? OR target_id=?",
+                (entity_id, entity_id),
+            )
+            return int(cur.rowcount or 0)
+
+    def is_entity_deleted(self, library_id: str, name: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM graph_entity_deletions WHERE library_id=? AND name=?",
+                (library_id, name),
+            ).fetchone()
+            return row is not None
+
+    def delete_entity(self, entity_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM graph_entities WHERE entity_id=?", (entity_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            entity = GraphEntity.from_row(row)
+            conn.execute(
+                "INSERT OR IGNORE INTO graph_entity_deletions (library_id, name, deleted_at) VALUES (?,?,?)",
+                (entity.library_id, entity.name, _now()),
+            )
+            for table, id_col in (
+                ("principle_entities", "entity_id"),
+                ("example_entities", "entity_id"),
+                ("warning_entities", "entity_id"),
+            ):
+                conn.execute(f"DELETE FROM {table} WHERE {id_col}=?", (entity_id,))
+            conn.execute("DELETE FROM graph_relations WHERE source_id=? OR target_id=?", (entity_id, entity_id))
+            conn.execute("DELETE FROM graph_entities WHERE entity_id=?", (entity_id,))
+            return True
+
+    def list_deleted_entities(self, library_id: str) -> List[Dict[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT library_id, name, deleted_at FROM graph_entity_deletions WHERE library_id=? ORDER BY deleted_at DESC",
+                (library_id,),
+            ).fetchall()
+            return [{"library_id": r["library_id"], "name": r["name"], "deleted_at": r["deleted_at"]} for r in rows]
+
+    def restore_deleted_entity(self, library_id: str, name: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM graph_entity_deletions WHERE library_id=? AND name=?",
+                (library_id, name),
+            )
+            return int(cur.rowcount or 0) > 0
+
+    def get_stats(self, library_id: Optional[str] = None, doc_id: Optional[str] = None) -> Dict[str, Any]:
+        with self._connect() as conn:
+            if library_id and doc_id:
+                entity_count = conn.execute(
+                    """SELECT COUNT(DISTINCT e.entity_id) FROM graph_entities e
+                       JOIN graph_relations r ON (e.entity_id = r.source_id OR e.entity_id = r.target_id)
+                       WHERE r.library_id=? AND r.doc_id=? AND e.status != 'rejected'""",
+                    (library_id, doc_id),
+                ).fetchone()[0]
+                relation_count = conn.execute(
+                    "SELECT COUNT(*) FROM graph_relations WHERE library_id=? AND doc_id=?",
+                    (library_id, doc_id),
+                ).fetchone()[0]
+                entities_by_layer = {
+                    r["layer"]: r["cnt"]
+                    for r in conn.execute(
+                        """SELECT e.layer, COUNT(DISTINCT e.entity_id) as cnt FROM graph_entities e
+                           JOIN graph_relations r ON (e.entity_id = r.source_id OR e.entity_id = r.target_id)
+                           WHERE r.library_id=? AND r.doc_id=? AND e.status != 'rejected'
+                           GROUP BY e.layer""",
+                        (library_id, doc_id),
+                    ).fetchall()
+                }
+                relations_by_type = {
+                    r["relation_type"]: r["cnt"]
+                    for r in conn.execute(
+                        "SELECT relation_type, COUNT(*) as cnt FROM graph_relations WHERE library_id=? AND doc_id=? GROUP BY relation_type",
+                        (library_id, doc_id),
+                    ).fetchall()
+                }
+            else:
+                entity_count = conn.execute(
+                    "SELECT COUNT(*) FROM graph_entities WHERE status='approved'"
+                ).fetchone()[0]
+                relation_count = conn.execute(
+                    "SELECT COUNT(*) FROM graph_relations"
+                ).fetchone()[0]
+                entities_by_layer = {
+                    r["layer"]: r["cnt"]
+                    for r in conn.execute(
+                        "SELECT layer, COUNT(*) as cnt FROM graph_entities WHERE status='approved' GROUP BY layer"
+                    ).fetchall()
+                }
+                relations_by_type = {
+                    r["relation_type"]: r["cnt"]
+                    for r in conn.execute(
+                        "SELECT relation_type, COUNT(*) as cnt FROM graph_relations GROUP BY relation_type"
+                    ).fetchall()
+                }
+        return {
+            "entity_count": entity_count,
+            "relation_count": relation_count,
+            "entities_by_layer": entities_by_layer,
+            "relations_by_type": relations_by_type,
+        }
+
+    def get_docs_with_graph(self, library_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT library_id, doc_id, COUNT(*) as relation_count
+                   FROM graph_relations WHERE library_id=?
+                   GROUP BY library_id, doc_id ORDER BY doc_id""",
+                (library_id,),
+            ).fetchall()
+        return [{"library_id": r["library_id"], "doc_id": r["doc_id"], "relation_count": r["relation_count"]} for r in rows]
+
+    # ---- 拆/并库图谱迁移（设计 D3/D4）：独占改标、共享复制、撞名收敛 ----
+    # 产物表（library_id+doc_id 键）与其实体联结表
+    _ARTIFACT_TABLES = ("graph_principles", "graph_examples", "graph_warnings", "graph_frameworks")
+    _JUNCTION_TABLES = {  # 联结表 → (父表, 父表主键列)
+        "principle_entities": ("graph_principles", "principle_id"),
+        "example_entities": ("graph_examples", "example_id"),
+        "warning_entities": ("graph_warnings", "warning_id"),
+    }
+
+    def move_doc_graph(self, source_library_id: str, target_library_id: str,
+                       doc_ids: List[str]) -> Dict[str, int]:
+        """把 doc 集合的图谱归属从源库迁到目标库。幂等，可重入；反向再调即回滚。
+
+        规则（D3）：实体被引关系全部属于被迁 doc → 独占 → 改标 library_id；
+        否则共享 → 在目标库复制副本，被迁 doc 的关系/联结重指副本。
+        撞 UNIQUE(name, library_id)（D4 合并场景）→ 引用重指目标行、删源行。
+        """
+        stats = {"entities_moved": 0, "entities_copied": 0, "entities_merged": 0,
+                 "relations_moved": 0, "artifacts_moved": 0}
+        if not doc_ids:
+            return stats
+        doc_set = set(doc_ids)
+        merged_map: Dict[str, str] = {}  # 收敛（D4）删行的源实体 → 目标行
+        with self._connect() as conn:
+            ph = ",".join("?" for _ in doc_ids)
+            relations = conn.execute(
+                f"SELECT relation_id, source_id, target_id FROM graph_relations "
+                f"WHERE library_id=? AND doc_id IN ({ph})",
+                [source_library_id, *doc_ids],
+            ).fetchall()
+            entity_ids = {r["source_id"] for r in relations} | {r["target_id"] for r in relations}
+            entity_map: Dict[str, str] = {}  # 源 entity_id → 目标库应指向的 entity_id（共享复制/撞名时非自身）
+            for eid in entity_ids:
+                row = conn.execute(
+                    "SELECT * FROM graph_entities WHERE entity_id=?", (eid,)
+                ).fetchone()
+                if row is None or row["library_id"] != source_library_id:
+                    continue
+                refs = conn.execute(
+                    "SELECT DISTINCT doc_id FROM graph_relations "
+                    "WHERE (source_id=? OR target_id=?) AND library_id=? AND doc_id != ''",
+                    (eid, eid, source_library_id),
+                ).fetchall()
+                exclusive = all(r["doc_id"] in doc_set for r in refs)
+                existing = conn.execute(
+                    "SELECT entity_id FROM graph_entities WHERE name=? AND library_id=?",
+                    (row["name"], target_library_id),
+                ).fetchone()
+                if exclusive and existing is None:
+                    conn.execute(
+                        "UPDATE graph_entities SET library_id=? WHERE entity_id=?",
+                        (target_library_id, eid),
+                    )
+                    stats["entities_moved"] += 1
+                    entity_map[eid] = eid
+                elif exclusive and existing is not None:
+                    # D4：独占但目标库已有同名 → 收敛到目标行。
+                    # FK(ON) 不允许先删被引用行——只登记，删行挪到全部引用重指之后（施工序）
+                    entity_map[eid] = existing["entity_id"]
+                    merged_map[eid] = existing["entity_id"]
+                    stats["entities_merged"] += 1
+                else:
+                    # 共享：目标库无副本则复制（entity_id 换新，其余列照搬）
+                    if existing is None:
+                        new_id = _generate_id()  # 模块级函数（graph_store.py:11）
+                        cols = [c[1] for c in conn.execute("PRAGMA table_info(graph_entities)")]
+                        values = {c: row[c] for c in cols if c not in ("entity_id", "library_id")}
+                        values["entity_id"] = new_id
+                        values["library_id"] = target_library_id
+                        conn.execute(
+                            f"INSERT INTO graph_entities ({', '.join(values.keys())}) "
+                            f"VALUES ({', '.join('?' for _ in values)})",
+                            list(values.values()),
+                        )
+                        entity_map[eid] = new_id
+                        stats["entities_copied"] += 1
+                    else:
+                        entity_map[eid] = existing["entity_id"]
+            for rel in relations:
+                new_src = entity_map.get(rel["source_id"], rel["source_id"])
+                new_tgt = entity_map.get(rel["target_id"], rel["target_id"])
+                try:
+                    conn.execute(
+                        "UPDATE graph_relations SET library_id=?, source_id=?, target_id=? "
+                        "WHERE relation_id=?",
+                        (target_library_id, new_src, new_tgt, rel["relation_id"]),
+                    )
+                    stats["relations_moved"] += 1
+                except sqlite3.IntegrityError:
+                    conn.execute("DELETE FROM graph_relations WHERE relation_id=?", (rel["relation_id"],))
+            for table in self._ARTIFACT_TABLES:
+                cur = conn.execute(
+                    f"UPDATE {table} SET library_id=? WHERE library_id=? AND doc_id IN ({ph})",
+                    [target_library_id, source_library_id, *doc_ids],
+                )
+                stats["artifacts_moved"] += cur.rowcount
+            for junction, (parent, pk) in self._JUNCTION_TABLES.items():
+                rows = conn.execute(
+                    f"SELECT j.rowid AS jrowid, j.entity_id FROM {junction} j JOIN {parent} p ON j.{pk}=p.{pk} "
+                    f"WHERE p.library_id=? AND p.doc_id IN ({ph})",
+                    [target_library_id, *doc_ids],
+                ).fetchall()
+                for jrow in rows:
+                    mapped = entity_map.get(jrow["entity_id"])
+                    if mapped and mapped != jrow["entity_id"]:
+                        try:
+                            conn.execute(
+                                f"UPDATE {junction} SET entity_id=? WHERE rowid=?",
+                                (mapped, jrow["jrowid"]),
+                            )
+                        except sqlite3.IntegrityError:
+                            conn.execute(f"DELETE FROM {junction} WHERE rowid=?", (jrow["jrowid"],))
+            # 收敛实体收尾（FK 序，D4）：被删源行的全部残留引用先重指目标行，最后统一删源行。
+            # FK(ON) 下任何「先删后指」都会撞约束；引用面 = relations + 三张实体联结表。
+            for src_eid, tgt_eid in merged_map.items():
+                for rrow in conn.execute(
+                    "SELECT relation_id, source_id, target_id FROM graph_relations "
+                    "WHERE source_id=? OR target_id=?", (src_eid, src_eid),
+                ).fetchall():
+                    new_src = tgt_eid if rrow["source_id"] == src_eid else rrow["source_id"]
+                    new_tgt = tgt_eid if rrow["target_id"] == src_eid else rrow["target_id"]
+                    try:
+                        conn.execute(
+                            "UPDATE graph_relations SET source_id=?, target_id=? WHERE relation_id=?",
+                            (new_src, new_tgt, rrow["relation_id"]),
+                        )
+                    except sqlite3.IntegrityError:
+                        # 目标行与源行在此 doc 已有同型关系 → 重复边，弃源边
+                        conn.execute("DELETE FROM graph_relations WHERE relation_id=?", (rrow["relation_id"],))
+                for junction, (parent, pk) in self._JUNCTION_TABLES.items():
+                    # 先清「同一父件已同时联 src 与 tgt」的重复行，再整体改指（避开 UNIQUE(parent,entity)）
+                    conn.execute(
+                        f"DELETE FROM {junction} WHERE entity_id=? AND {pk} IN "
+                        f"(SELECT {pk} FROM {junction} WHERE entity_id=?)", (src_eid, tgt_eid),
+                    )
+                    conn.execute(
+                        f"UPDATE {junction} SET entity_id=? WHERE entity_id=?", (tgt_eid, src_eid),
+                    )
+            for src_eid in merged_map:
+                conn.execute("DELETE FROM graph_entities WHERE entity_id=?", (src_eid,))
+            # 墓碑表 graph_entity_deletions v1 不迁移（评审 P2：共享复制给目标库插墓碑
+            # 会屏蔽活实体再抽取；独占改标场景墓碑留源库属可接受残留，回滚随实体改标一并消失）
+            conn.commit()
+        return stats
