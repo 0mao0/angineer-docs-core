@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- fix: 拆分产物的「组文件」桶在任务开始时从已注册侧钉定。拆到新库的执行全程目的地尚未注册，`_relabel_group_tables` 按 `to_lib` 现查 `resolve_index_db_path` 会回退到 `knowledge_index` 桶、把 UPDATE 写进陈年副本，组文件纹丝不动——对账「组文件改标 0/5」必败（2026-10-07 生产 `mig-cd0e1350f7fe` 实踩）。组桶现沿 P0-2 collection 同款纪律随 `migrate_doc` / `rollback_doc` / `_compensate` / `_verify` 显式传递，回滚分支从原源库钉定
+- fix: 门禁与回滚注册表的收尾改走 `set_status_if_registered`——未注册的新库没有行可挂门禁、也无需 retire，原 `set_status` 缺行必 `KeyError`，会让「全部回滚」在门禁一步即崩
+- chore: 新增 `tests/test_kb_migrator_group_bucket.py`——复刻生产形态（无 `group_db` 注入 + 目的地未注册 + 回退桶陈年副本）两例，修复前逐字复现 0/5 与 `KeyError`
+
 ## 0.1.1
 
 - fix: **`import docs_core` 不再依赖数据根**。`kb_migration_audit` 的审计路径此前是模块级常量
