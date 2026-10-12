@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3
+
+- feat: **独立宿主壳 `[server]` extra（retrieval-api）**——`docs_core.server:app` 提供只读检索面：`POST /api/knowledge/internal/retrieve`、`/internal/entity-search`、`GET /internal/doc-nodes`、`/libraries`、`/stats`、`GET /documents/{doc_id}/download`（`?disposition=inline`）、`GET /health`（含数据根 / 注册表挂载状态）。数据面全参数化（`ANGINEER_DATA_ROOT` / `KNOWLEDGE_BASE_DIR` / `QDRANT_URL` / `EMBEDDING_CONFIGS`…），不依赖仓库树；可选 `ANGINEER_API_TOKEN` 门；fastapi / uvicorn 只进 extra
+- feat: **语料包（corpus package）**——新增 `docs_core.corpus_package`：按库打包（registry 行 + meta 摘行 + 组 sqlite checkpoint + documents 树 + qdrant snapshot + sha256 manifest），`iter_package_zip` 流式产出供服务端不落盘，`ExportTasks` 任务态封装（管理后台与导入侧配套在主仓库）
+- feat: 库组定版换名——系统库组 `standards → system`（`DEFAULT_GROUP` 随之）、规范库组（原自建 `guifan`）→ `standards`；`GROUP_DEFAULTS` 的 collection / sqlite_file / qdrant 集合随名互换归属（迁移脚本在主仓库 `scripts/migrate_group_rename.py`）
+- fix: `parse_records` 库路径改经 `resolve_data_root()` 解析——`ANGINEER_DATA_ROOT` 参数化，wheel 树外安装不再因找不到仓库树抛错（此前该路径直接 `resolve_repo_root()`）
+- chore: 知识库统计聚合抽为 `docs_core.knowledge_stats`（主仓库 docs-api 与检索薄壳共用单一实现）；若干「已完结清理」注释勘误
+
 ## 0.1.2
 
 - fix: 拆分产物的「组文件」桶在任务开始时从已注册侧钉定。拆到新库的执行全程目的地尚未注册，`_relabel_group_tables` 按 `to_lib` 现查 `resolve_index_db_path` 会回退到 `knowledge_index` 桶、把 UPDATE 写进陈年副本，组文件纹丝不动——对账「组文件改标 0/5」必败（2026-10-07 生产 `mig-cd0e1350f7fe` 实踩）。组桶现沿 P0-2 collection 同款纪律随 `migrate_doc` / `rollback_doc` / `_compensate` / `_verify` 显式传递，回滚分支从原源库钉定

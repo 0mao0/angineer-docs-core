@@ -16,10 +16,10 @@ jobs:
       - name: Install package and test deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e . pytest
+          pip install -e ".[dev]"
       - name: Run tests
         # 独立仓没有仓库树与 .env：tests/conftest.py 会补数据根与向量后端默认值，
-        # 需要 docs-api 的跨服务用例自动跳过（预期 507 passed / 17 skipped）。
+        # 需要 docs-api 的跨服务用例自动跳过（预期 516 passed / 16 skipped，含独立宿主壳管道用例）。
         run: pytest tests -q
 
   build:
