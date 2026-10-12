@@ -1,4 +1,4 @@
-"""库组注册表：``library_id → 组 → 存储位置`` 的唯一真相源（docs/plan-kb-split-groups.md §二）。
+"""库组注册表：``library_id → 组 → 存储位置`` 的唯一真相源（docs/plan-kb-split-groups.md §二，该计划已完结清理、git 历史可查）。
 
 设计约束：
 - 落独立单文件 ``data/registry.sqlite``——不放任何组内 sqlite（knowledge_index 拆完自身就在
@@ -36,12 +36,20 @@ STATUS_MIGRATING = "migrating"
 STATUS_RETIRED = "retired"
 _VALID_STATUS = {STATUS_ACTIVE, STATUS_MIGRATING, STATUS_RETIRED}
 
-DEFAULT_GROUP = "standards"
+DEFAULT_GROUP = "system"
 
 # 组 → 存储默认。collection 阶段一已拆；sqlite_file 是阶段二目标组文件（注册行在 flip-sqlite
 # 前仍挂 _DEFAULT_SQLITE_FILE 单文件）。libraries_dir 供目录归位（阶段二后半）使用。
 # 评测 collection 定名 evals_corpus（与成绩库 evals.sqlite 区分，见 plan §九-5）。
+# 2026-10-09 业主定版两组换名（存储层同改，迁移见 scripts/migrate_group_rename.py）：
+#   系统库组 standards → system（DEFAULT_GROUP 随之），规范库组（原自建 guifan）→ standards——
+#   「standards」这个名字本就该归规范语料；两组的 collection/sqlite_file/qdrant 集合随之互换归属。
 GROUP_DEFAULTS: Dict[str, Dict[str, str]] = {
+    "system": {
+        "collection": "system",
+        "sqlite_file": "knowledge/groups/system.sqlite",
+        "libraries_dir": "knowledge/libraries",
+    },
     "standards": {
         "collection": "standards",
         "sqlite_file": "knowledge/groups/standards.sqlite",
@@ -235,7 +243,7 @@ def set_group(library_id: str, group_name: str) -> LibraryRecord:
     """改组迁移（多库管理 tab）：换组名 + 组默认 collection + sqlite_file 按新组现状重新推导。
 
     只改注册行，不搬数据——与 register_library 缺省推导同口径：新组组文件已存在则挂组文件，
-    否则挂过渡单文件。数据物理搬迁属阶段二 flip，拆组前置条件见 plan-kb-split-groups。
+    否则挂过渡单文件。数据物理搬迁属阶段二 flip，拆组前置条件见 plan-kb-split-groups（已完结清理、git 历史可查）。
     """
     if group_name not in GROUP_DEFAULTS and get_custom_group(group_name) is None:
         raise ValueError(f"未知库组: {group_name}（合法组 {sorted(GROUP_DEFAULTS)} + 已建自定义组）")
