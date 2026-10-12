@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+- feat: **engine 端口 HTTP 面**（`docs_core.server.engine_ports`）——新增 5 个内部端点：`/internal/normalize-query`（条款号归一化）、`/internal/rerank`（phrase rerank）、`/internal/relevant-citations`（引用挑选）、`/internal/table-blocks`（canonical 表格块批量取数）、`/internal/engtool-run`（外部工具执行，404=工具不存在 / 503=注册表不可用 / 500=执行异常 三态）；复用 agent_port / reranker 同一份实现，供 chat 壳 `http_ports` 适配器消费（citations 修单）；主仓库 docs-api 同批挂载保持两端面镜像
+- chore: `docs_core.server` 惰性导出（docs-api 导入 engine_ports 不再构造壳应用）；壳启动即配 `logging.basicConfig`（同 docs-api/aichat-api）
+
 ## 0.1.3
 
 - feat: **独立宿主壳 `[server]` extra（retrieval-api）**——`docs_core.server:app` 提供只读检索面：`POST /api/knowledge/internal/retrieve`、`/internal/entity-search`、`GET /internal/doc-nodes`、`/libraries`、`/stats`、`GET /documents/{doc_id}/download`（`?disposition=inline`）、`GET /health`（含数据根 / 注册表挂载状态）。数据面全参数化（`ANGINEER_DATA_ROOT` / `KNOWLEDGE_BASE_DIR` / `QDRANT_URL` / `EMBEDDING_CONFIGS`…），不依赖仓库树；可选 `ANGINEER_API_TOKEN` 门；fastapi / uvicorn 只进 extra
