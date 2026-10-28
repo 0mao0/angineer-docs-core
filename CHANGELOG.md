@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.5
+
+- feat: 图谱存储按库拆分（一库一文件）——全局 `graph.sqlite` 改为每库 `knowledge/libraries/<库>/graph.sqlite`，启动首跑自动拆分迁移（备份改名、逐表对账、幂等可重跑；失败不阻塞启动、读写回退全局文件）；图谱页签与 API、维护任务、导出产物查找全部改按库解析；拆并适配跨文件迁移
+- feat: 导入闭包实体闸移除——带图谱语料包跨环境导入不再被目标实例同名词实体阻断，图谱阶段整文件按库落位（冲突闸只查库/组/文档/索引文件碰撞）
+- fix(export) 三修（生产实跑实踩）：无 graph 文件的库导出整包 failed（`closing(...).close()` 在 Py3.11 无此方法）；组路由下本库图谱静默清零（导出自查改走全站唯一解析器 `resolve_graph_db_for_library`）；库根 graph/index sqlite 及 WAL/SHM 边车不再随 files/ 扫描进包（流式拷贝中途边车被 checkpoint 回收即断流）
+- fix(graph): `get_graph_snapshot` 不带 doc_id 必 500——else 分支历史裸名 `store` 改 `self.store`，补回归测试钉住两形态
+- chore: PoPo 解耦收官——删除内化副本，改依赖 popo-client（dgx-spark-popo 独立库）文档级 HTTP API；popo-client 依赖撤 git 直引、降为 `[popo]` extra（PEP 508 git 直引下构建容器无 git 即必败）
+- fix(并发): 向量入库加并发闸（`VECTORS_MAX_CONCURRENCY` 默认 8，按到达序排队）；图谱存储 sqlite busy 超时 5s→30s——修补跑并发下 `database is locked` 失败风暴
+- feat(import): 语料包 v2 导入链（上传/预检/应用/进度路由 + CLI + dry-run 预览）；retired 同 id 允许重新导入；导入补 parse_records 上传台账、library_id 正则与图谱逐表对账；支持库根级文件
+- fix(retrieval): 引用解析表默认覆盖全部 cite 标记（修第 6 条以后前端回退 doc_id）；doc_search 时间维度（sort_by/date_after/date_before）与 entity_contains、doc_read section 章节读（与检索壳六端口同步）；多行表头压成单行、数据行带序号
+- fix(ops): 删库 Windows 文件锁重试与 deleting 重试兜底、清 parse_records 台账；拆并拒绝同组异构桶、非空库跨桶改组拒绝、独立桶 retired 引用保护；零向量包不查 qdrant collection；PyMuPDF 钉 1.28.2 并切腾讯云 pip 镜像
+
+
 ## 0.1.4
 
 - feat: **engine 端口 HTTP 面**（`docs_core.server.engine_ports`）——新增 5 个内部端点：`/internal/normalize-query`（条款号归一化）、`/internal/rerank`（phrase rerank）、`/internal/relevant-citations`（引用挑选）、`/internal/table-blocks`（canonical 表格块批量取数）、`/internal/engtool-run`（外部工具执行，404=工具不存在 / 503=注册表不可用 / 500=执行异常 三态）；复用 agent_port / reranker 同一份实现，供 chat 壳 `http_ports` 适配器消费（citations 修单）；主仓库 docs-api 同批挂载保持两端面镜像
