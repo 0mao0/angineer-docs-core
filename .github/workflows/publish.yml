@@ -16,9 +16,9 @@ jobs:
       - name: Install package and test deps
         run: |
           python -m pip install --upgrade pip
-          # [popo]：popo-client 不在 PyPI，走 dgx-spark-popo 公开仓 git 直引（popo 三段链子进程依赖）；
-          # 核心安装（不带 extra）也必须可独立成功——PyPI 用户默认路径。
-          pip install -e ".[dev,popo]"
+          # [popo] extra 已退役（PyPI 禁 git 直引依赖 + popo-client 未上 PyPI，见 pyproject 注释）；
+          # 测试零依赖 popo_client（popo 三段链为子进程运行时依赖）。
+          pip install -e ".[dev]"
       - name: Run tests
         # 独立仓没有仓库树与 .env：tests/conftest.py 会补数据根与向量后端默认值，
         # 需要 docs-api 的跨服务用例自动跳过（预期 516 passed / 16 skipped，含独立宿主壳管道用例）。
