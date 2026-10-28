@@ -16,7 +16,9 @@ jobs:
       - name: Install package and test deps
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          # [popo]：popo-client 不在 PyPI，走 dgx-spark-popo 公开仓 git 直引（popo 三段链子进程依赖）；
+          # 核心安装（不带 extra）也必须可独立成功——PyPI 用户默认路径。
+          pip install -e ".[dev,popo]"
       - name: Run tests
         # 独立仓没有仓库树与 .env：tests/conftest.py 会补数据根与向量后端默认值，
         # 需要 docs-api 的跨服务用例自动跳过（预期 516 passed / 16 skipped，含独立宿主壳管道用例）。
@@ -44,8 +46,12 @@ jobs:
             echo "::error::src/docs_core/__init__.py __version__ $SRC != pyproject version $PKG"
             exit 1
           fi
-      # PoPo 解耦后（0.1.5 起）popo 由独立包 popo-client 承接（core 依赖 popo-client>=0.1.0，
-      # popo 解析走 [popo] extra），本仓 wheel 不再内嵌 popo fork——旧「wheel 必须带 popo」校验随之退役
+      # PoPo 解耦后（0.1.5 起）popo 由独立包 popo-client 承接（[popo] extra git 直引），
+      # 本仓 wheel 不再内嵌 popo fork——旧「wheel 必须带 popo」校验随之退役
+      - name: Build distributions
+        run: |
+          python -m pip install build
+          python -m build
       - name: Check distributions
         run: pipx run twine check dist/*
       - uses: actions/upload-artifact@v4
