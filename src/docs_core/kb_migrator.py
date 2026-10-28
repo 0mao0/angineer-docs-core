@@ -215,6 +215,10 @@ class KbMigrator:
             blockers.append("目标库不是可用状态")
         if target_rec.group_name != source_rec.group_name:
             blockers.append("v1 仅支持同组迁移（两库组不同）")
+        elif (target_rec.sqlite_file, target_rec.collection) != (
+                source_rec.sqlite_file, source_rec.collection):
+            blockers.append(
+                "同组异构桶库不支持拆并（导入库为独立桶），请先联系维护迁移")
 
     def _face_counts(self, source: str, target: str, moved: List[str], op: str) -> Dict[str, Any]:
         ph = ",".join("?" for _ in moved) or "''"  # 空集兜底（合并空源库）
@@ -306,12 +310,12 @@ class KbMigrator:
         }, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    # 组文件 doc 键全表清单：与 scripts/split_sqlite_groups.py:26-38 的 _DOC_TABLES 逐字同步（12 张）
+    # 组文件 doc 键全表清单：与 scripts/split_sqlite_groups.py:26-38 的 _DOC_TABLES 逐字同步（13 张）
     _DOC_TABLES: tuple = (
         "canonical_documents", "canonical_pages", "canonical_blocks", "canonical_chunks",
         "canonical_tables", "canonical_outlines", "canonical_citation_targets",
         "canonical_chunk_fts", "canonical_vectors", "doc_blocks", "document_segments",
-        "doc_block_corrections",
+        "doc_block_corrections", "doc_catalog",
     )
 
     # 迁移有意改写的列，不计入长度和不变量（施工修：计划稿「改标不改变这些值」的前提
@@ -490,9 +494,16 @@ class KbMigrator:
         return None
 
     def _move_doc_graph(self, doc_id: str, from_lib: str, to_lib: str) -> None:
-        if not self.graph_db.exists():
+        """移库图谱面：一库一文件（plan-graph-per-library-split）下按源/目标文件分发；
+        迁移前两端仍在同一全局文件时走同文件原实现。"""
+        from docs_core.step07_graph import graph_files
+        from docs_core.step07_graph.graph_store import move_doc_graph_between_files
+
+        src = graph_files.resolve_graph_db_for_library(from_lib)
+        dst = graph_files.resolve_graph_db_for_library(to_lib)
+        if not src.exists() and not dst.exists():
             return
-        self._graph_store().move_doc_graph(from_lib, to_lib, [doc_id])
+        move_doc_graph_between_files(src, dst, from_lib, to_lib, [doc_id])
 
     # ---- 主循环（设计 §5.3 全局两阶段 + 评审 P0-3 显式回滚分支）----
     def run_task(self, task_id: str, *, operator: str = "admin") -> None:

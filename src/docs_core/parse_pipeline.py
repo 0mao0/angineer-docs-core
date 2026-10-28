@@ -6,6 +6,7 @@
 - 阶段状态通过 meta_store.upsert_parse_stage 持久化（doc_parse_stages 表）。
 - ParseOrchestrator：创建/取消/重试解析任务，在后台线程驱动本管线并同步状态。
 """
+import hashlib
 import logging
 import itertools
 import os
@@ -223,11 +224,19 @@ def _run_convert(ctx: StageContext) -> str:
 
     from docs_core.step02_convert2pdf.convert2pdf import convert_to_pdf
 
-    # 转换输出直接落在源文件目录（与上传的 docx 同目录），地址稳定且与上传位置一致
-    source_dir = Path(ctx.source_path).parent
-    source_dir.mkdir(parents=True, exist_ok=True)
-    # 转换期间可取消：cancel_check 由任务线程注入，取消时终止 soffice 子进程
-    pdf_path = convert_to_pdf(ctx.source_path, str(source_dir), cancel_check=ctx.cancel_check)
+    if _CONVERT_GATE.should_wait(ctx.arrival_seq):
+        _mark_stage_queued(
+            ctx, "Office 转 PDF 排队",
+            "等待 LibreOffice 转换槽位（前序文档转完后自动开始）",
+            "等待 LibreOffice 转换槽位",
+        )
+    with convert_slot(ctx.cancel_check, arrival_seq=ctx.arrival_seq):
+        _mark_stage_running(ctx, "convert", "Office 转 PDF 中")
+        # 转换输出直接落在源文件目录（与上传的 docx 同目录），地址稳定且与上传位置一致
+        source_dir = Path(ctx.source_path).parent
+        source_dir.mkdir(parents=True, exist_ok=True)
+        # 转换期间可取消：cancel_check 由任务线程注入，取消时终止 soffice 子进程
+        pdf_path = convert_to_pdf(ctx.source_path, str(source_dir), cancel_check=ctx.cancel_check)
     ctx.input_summary = ctx.source_path
     ctx.output_summary = pdf_path
     ctx.source_path = pdf_path
@@ -243,28 +252,46 @@ def _run_raw_parse(ctx: StageContext) -> str:
     def _on_step(step: str, status: str = "done", detail: str = "") -> None:
         ctx.log_step(step, status, detail)
 
-    if _MINERU_GPU_GATE.should_wait(ctx.arrival_seq):
-        _mark_stage_queued(
-            ctx, "MinerU GPU 排队",
-            "等待 MinerU GPU 资源（前序任务完成后自动开始）",
-            "等待 MinerU GPU 资源",
-        )
-    with mineru_gpu_slot(ctx.cancel_check, arrival_seq=ctx.arrival_seq):
-        _mark_stage_running(ctx, "raw_parse", "MinerU 解析中")
-        try:
-            # 解析器自建临时目录并负责落盘（save_markdown + save_parse_artifacts）
-            parse_result = task_parser.parse_to_raw_artifacts(
-                input_path=ctx.source_path,
-                library_id=ctx.library_id,
-                doc_id=ctx.doc_id,
-                on_step=_on_step,
+    ep_name = assign_mineru_endpoint(ctx.doc_id, (ctx.parse_options or {}).get("mineru_endpoint"))
+    if ep_name:
+        task_parser.preferred_endpoint = ep_name
+
+    # 端点槽位**跟着实际使用的端点走**（2026-10-14）：偏好端点失败回退时会先释放它、
+    # 再取回退端点的额度。若按"分配到的端点"取槽位，company 一断，这批文档就会占着
+    # company 槽位去打 DGX——DGX 瞬间超并发（实测高并发会挂），故必须逐端点取得。
+    def _slot_acquire(name: str) -> None:
+        gate = _endpoint_gate(name)
+        if gate.should_wait(ctx.arrival_seq):
+            _mark_stage_queued(
+                ctx, "MinerU 排队",
+                f"等待 MinerU 资源（{name} 端点，前序任务完成后自动开始）",
+                "等待 MinerU 资源",
             )
-        except Exception as exc:
-            # MinerU 解析被取消（_abort_event 已设置）：转成取消异常，向上传播为 cancelled
-            if getattr(task_parser, "_abort_event", None) is not None and task_parser._abort_event.is_set():
-                raise ParseTaskCancelledError("用户手动取消任务") from exc
-            ctx.log_step("MinerU 引擎解析", "failed", f"{type(exc).__name__}: {str(exc)[:200]}")
-            raise
+        gate.acquire(ctx.arrival_seq, ctx.cancel_check)
+        # 拿到槽位才算"在跑"（与 convert 闸门一致）：阶段行的 started_at 即真实工作起点，
+        # 排队时间不会被算进阶段耗时（2026-10-14 实踩：先标 running 再排队，甘特/折线里
+        # raw_parse 被算成 120 并发、单篇 18 分钟）。
+        _mark_stage_running(ctx, "raw_parse", "MinerU 解析中")
+
+    def _slot_release(name: str) -> None:
+        _endpoint_gate(name).release()
+
+    task_parser.slot_acquire = _slot_acquire
+    task_parser.slot_release = _slot_release
+    try:
+        # 解析器自建临时目录并负责落盘（save_markdown + save_parse_artifacts）
+        parse_result = task_parser.parse_to_raw_artifacts(
+            input_path=ctx.source_path,
+            library_id=ctx.library_id,
+            doc_id=ctx.doc_id,
+            on_step=_on_step,
+        )
+    except Exception as exc:
+        # MinerU 解析被取消（_abort_event 已设置）：转成取消异常，向上传播为 cancelled
+        if getattr(task_parser, "_abort_event", None) is not None and task_parser._abort_event.is_set():
+            raise ParseTaskCancelledError("用户手动取消任务") from exc
+        ctx.log_step("MinerU 引擎解析", "failed", f"{type(exc).__name__}: {str(exc)[:200]}")
+        raise
     if not parse_result.get("success"):
         ctx.log_step("MinerU 引擎解析", "failed", str(parse_result.get("error") or "MinerU解析失败")[:200])
         raise RuntimeError(parse_result.get("error") or "MinerU解析失败")
@@ -503,7 +530,15 @@ def _run_fts(ctx: StageContext) -> str:
             ctx.cancel_check()
         ctx.log_step(step, status, detail)
 
-    result = build_sqlite_index_from_graph(ctx.library_id, ctx.doc_id, on_step=_on_step)
+    if _FTS_GATE.should_wait(ctx.arrival_seq):
+        _mark_stage_queued(
+            ctx, "FTS 建索引排队",
+            "等待 SQLite/FTS 建索引槽位（同一时刻只允许少量并发写库）",
+            "等待 FTS 建索引槽位",
+        )
+    with fts_slot(ctx.cancel_check, arrival_seq=ctx.arrival_seq):
+        _mark_stage_running(ctx, "fts", "SQLite+FTS 建索引中")
+        result = build_sqlite_index_from_graph(ctx.library_id, ctx.doc_id, on_step=_on_step)
     ctx.input_summary = str(paths.get_graph_jsonl_path(ctx.library_id, ctx.doc_id))
     ctx.output_summary = (
         f"canonical SQLite + doc_blocks + segments + canonical_chunk_fts "
@@ -512,21 +547,30 @@ def _run_fts(ctx: StageContext) -> str:
     return f"SQLite 建库完成，FTS 重建完成（{result.get('canonical_blocks_count', 0)} blocks）"
 
 
-# ---- MinerU/GPU 并发闸门：同一时刻最多一个 MinerU 任务占用 GPU ----
+# ---- MinerU/GPU 并发闸门：同一时刻最多 MINERU_MAX_CONCURRENCY 个任务占用 GPU ----
 class _FifoGpuGate:
-    """进程级 FIFO GPU 闸门：按提交序号（arrival_seq）严格先来先服务。
+    """进程级 GPU 闸门：按「到达本闸门」的先后排队（本闸门独立 FCFS）。
 
-    即使 GPU 空闲，序号靠后的任务也必须等序号靠前的任务先获得（或排队期间
-    被取消并让位），确保“谁先提交谁先用资源”，不受前序阶段（source_prep /
-    convert）完成速度影响。排队期间被取消的序号会被跳过，避免后续任务永久等待。
+    2026-10-14 语义修订（消除跨阶段头阻塞）：
+    - 旧语义：按任务提交序号严格先来先服务——序号靠前的任务即使还在更早的阶段
+      （例：PoPo 闸门面对还在 MinerU 里的前序任务），也会占住本闸门队首；即使有空槽，
+      后序任务也不能进入（实测 PoPo 空槽硬等 88–100 分钟、MinerU 最长等 574 分钟）。
+    - 新语义：只对「已经到达本闸门」的任务排队——到达即领本闸门排队号，先到本阶段者
+      先获得槽位；仍在更早阶段的任务不占本闸门排位（尚未到达 = 与本闸门无关）。
+      三个闸门各自独立排队、跨阶段互不绑序；阶段内仍是 FCFS（可解释、无饿死）。
+
+    arrival_seq 在本类中只作任务身份键：同一任务重复请求（PoPo 瞬时失败重试）
+    沿用同一排队号；排队号已消耗的重复请求按「有空槽即直通」处理。
     """
 
     def __init__(self, max_concurrency: int = 1) -> None:
         self._max_concurrency = max(1, int(max_concurrency))
         self._cond = threading.Condition()
         self._tokens = self._max_concurrency
-        self._next_seq = 1
-        self._cancelled_seqs: set[int] = set()
+        self._next_ticket = 1                       # 下一个待发放的排队号
+        self._serving = 1                           # 当前应被服务的排队号（队首）
+        self._tickets: dict[int, int] = {}          # 任务键 -> 排队号
+        self._cancelled_tickets: set[int] = set()   # 未获槽即取消/退出的排队号
 
     @property
     def available(self) -> int:
@@ -535,49 +579,64 @@ class _FifoGpuGate:
             return self._tokens
 
     def _skip_cancelled_locked(self) -> None:
-        """跳过排队期间被取消的序号，避免后续任务永久等待。"""
-        while self._next_seq in self._cancelled_seqs:
-            self._cancelled_seqs.discard(self._next_seq)
-            self._next_seq += 1
+        """跳过未获槽即取消/退出的排队号，避免后续任务永久等待。"""
+        while self._serving in self._cancelled_tickets:
+            self._cancelled_tickets.discard(self._serving)
+            self._serving += 1
 
-    def should_wait(self, seq: int) -> bool:
-        """该序号是否还需要排队（用于 queued 状态提示）。"""
-        with self._cond:
-            return seq != self._next_seq or self._tokens <= 0
+    def should_wait(self, arrival_seq: int) -> bool:
+        """该任务此刻到闸是否要排队（用于 queued 状态提示；不分配排队号）。
 
-    def skip(self, seq: int) -> None:
-        """跳过在到达闸门前就失败/退出的序号，避免后续任务永久等待。
-
-        已经获得槽位的任务（seq < next_seq）调用此方法为无操作，
-        避免重复推进队列。
+        预测口径与 acquire 一致：队首还有更早到达的任务、或无空闲槽 -> 会排队。
         """
         with self._cond:
-            if seq >= self._next_seq:
-                self._cancelled_seqs.add(seq)
+            ticket = self._tickets.get(arrival_seq)
+            if ticket is None:
+                ticket = self._next_ticket  # 预测：新到者将拿到队尾排队号
+            if ticket < self._serving:
+                # 排队号已消耗的重复请求（如 PoPo 重试）：有空槽即直通
+                return self._tokens <= 0
+            return ticket != self._serving or self._tokens <= 0
+
+    def skip(self, arrival_seq: int) -> None:
+        """任务在获槽前退出时作废其排队号。
+
+        未到过本闸门的任务（无排队号）为无操作——新语义下它们不占本闸门排位；
+        已获槽的任务（排队号已消耗）同为无操作。闸门内等待被取消的路径由
+        acquire 自行登记，本方法只作任务退出的兜底。
+        """
+        with self._cond:
+            ticket = self._tickets.get(arrival_seq)
+            if ticket is not None and ticket >= self._serving:
+                self._cancelled_tickets.add(ticket)
                 self._skip_cancelled_locked()
                 self._cond.notify_all()
 
     def acquire(
         self,
-        seq: int,
+        arrival_seq: int,
         cancel_check: Optional[Callable[[], None]] = None,
         poll_interval: float = 0.5,
     ) -> None:
-        """按提交序号阻塞等待令牌；等待期间按 poll_interval 轮询取消标志。"""
+        """按本闸门排队号阻塞等待令牌；等待期间按 poll_interval 轮询取消标志。"""
         with self._cond:
+            ticket = self._tickets.get(arrival_seq)
+            if ticket is None:
+                ticket = self._next_ticket
+                self._next_ticket += 1
+                self._tickets[arrival_seq] = ticket
             while True:
-                if seq == self._next_seq and self._tokens > 0:
+                if ticket == self._serving and self._tokens > 0:
                     self._tokens -= 1
-                    self._next_seq += 1
+                    self._serving += 1
                     self._skip_cancelled_locked()
                     self._cond.notify_all()
                     return
-                if seq < self._next_seq and self._tokens > 0:
-                    # 晚到/重复序号兜底：不取消任务，等待到空闲令牌后直接放行。
-                    # 正常情况下不应发生；发生时不阻塞队列推进，也不误伤任务。
+                if ticket < self._serving and self._tokens > 0:
+                    # 重复请求兜底（如 PoPo 瞬时失败重试）：排队号已消耗，有空槽直通
                     logger.warning(
-                        "GPU 闸门兜底放行（晚到序号）: seq=%s next_seq=%s tokens=%s pid=%s",
-                        seq, self._next_seq, self._tokens, os.getpid(),
+                        "GPU 闸门直通（重复请求）: key=%s ticket=%s serving=%s tokens=%s pid=%s",
+                        arrival_seq, ticket, self._serving, self._tokens, os.getpid(),
                     )
                     self._tokens -= 1
                     return
@@ -585,9 +644,9 @@ class _FifoGpuGate:
                     try:
                         cancel_check()  # 取消时抛 ParseTaskCancelledError，不消费令牌
                     except BaseException:
-                        # 排队期间被取消：登记序号并让位给后续任务
-                        self._cancelled_seqs.add(seq)
-                        if seq >= self._next_seq:
+                        # 排队期间被取消：作废排队号并让位给后续任务
+                        if ticket >= self._serving:
+                            self._cancelled_tickets.add(ticket)
                             self._skip_cancelled_locked()
                         self._cond.notify_all()
                         raise
@@ -615,12 +674,75 @@ def mineru_gpu_slot(
     cancel_check: Optional[Callable[[], None]] = None,
     arrival_seq: int = 1,
 ):
-    """MinerU 任务占用的 GPU 槽位：按提交序号先来先服务，进入 raw_parse 前获取。"""
+    """MinerU 任务占用的 GPU 槽位：按到达本闸门的先后排队（本闸门独立 FCFS），进入 raw_parse 前获取。"""
     _MINERU_GPU_GATE.acquire(arrival_seq, cancel_check)
     try:
         yield
     finally:
         _MINERU_GPU_GATE.release()
+
+
+# ---- MinerU 端点分流（2026-10-14：company 端点分担大批量解析） ----
+# 动机：单端点并发上限 = 全队列吞吐上限（MINERU_MAX_CONCURRENCY=2 → 约 3 篇/分钟）。
+# 做法：按 doc_id 哈希把文档分到 MINERU_ENDPOINT_WEIGHTS 里的端点（确定性、无需改 API），
+# 每个端点在 MinerU 端各自一个到达序闸门，cap 由 MINERU_ENDPOINT_CAPS 指定
+# （未指定的端点回落 MINERU_MAX_CONCURRENCY）。端点偏好写入解析器，其余端点仍作回退。
+def _parse_kv_int(raw: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for part in (raw or "").split(","):
+        if ":" not in part:
+            continue
+        k, _, v = part.partition(":")
+        try:
+            out[k.strip()] = max(1, int(v))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+_MINERU_ENDPOINT_WEIGHTS = _parse_kv_int(os.getenv("MINERU_ENDPOINT_WEIGHTS", ""))
+_MINERU_ENDPOINT_CAPS = _parse_kv_int(os.getenv("MINERU_ENDPOINT_CAPS", ""))
+_ENDPOINT_GATES: Dict[str, _FifoGpuGate] = {}
+
+
+def _endpoint_gate(name: Optional[str]) -> _FifoGpuGate:
+    """端点闸门：按端点名各持一个（端点内 FCFS）；无端点名时用全局闸门。"""
+    if not name:
+        return _MINERU_GPU_GATE
+    gate = _ENDPOINT_GATES.get(name)
+    if gate is None:
+        gate = _FifoGpuGate(_MINERU_ENDPOINT_CAPS.get(name, _MINERU_MAX_CONCURRENCY))
+        _ENDPOINT_GATES[name] = gate
+        logger.info("MinerU 端点闸门: %s cap=%s", name, _MINERU_ENDPOINT_CAPS.get(name, _MINERU_MAX_CONCURRENCY))
+    return gate
+
+
+def assign_mineru_endpoint(doc_id: str, explicit: Optional[str] = None) -> Optional[str]:
+    """把文档分到某个 MinerU 端点（None = 不指定，走 MINERU_CONFIGS 顺序）。"""
+    if explicit:
+        return explicit
+    total = sum(_MINERU_ENDPOINT_WEIGHTS.values())
+    if not _MINERU_ENDPOINT_WEIGHTS or total <= 0:
+        return None
+    slot = int(hashlib.sha256(str(doc_id).encode()).hexdigest()[:8], 16) % total
+    acc = 0
+    for name, weight in _MINERU_ENDPOINT_WEIGHTS.items():
+        acc += weight
+        if slot < acc:
+            return name
+    return None
+
+
+@contextmanager
+def mineru_endpoint_slot(name: Optional[str], cancel_check: Optional[Callable[[], None]] = None,
+                         arrival_seq: int = 1):
+    """按端点取槽位（端点内按到达序 FCFS）。"""
+    gate = _endpoint_gate(name)
+    gate.acquire(arrival_seq, cancel_check)
+    try:
+        yield
+    finally:
+        gate.release()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -643,7 +765,7 @@ def popo_inference_slot(
     cancel_check: Optional[Callable[[], None]] = None,
     arrival_seq: int = 1,
 ):
-    """PoPo 4B 推理（远端 vLLM）槽位：按提交序号先来先服务，防止并发打满远端。"""
+    """PoPo 4B 推理（远端 vLLM）槽位：按到达本闸门的先后排队（本闸门独立 FCFS），防止并发打满远端。"""
     _POPO_GATE.acquire(arrival_seq, cancel_check)
     try:
         yield
@@ -662,12 +784,75 @@ def figure_describe_slot(
     cancel_check: Optional[Callable[[], None]] = None,
     arrival_seq: int = 1,
 ):
-    """图描述 VLM（远端 chat 端点）槽位：按提交序号先来先服务。"""
+    """图描述 VLM（远端 chat 端点）槽位：按到达本闸门的先后排队（本闸门独立 FCFS）。"""
     _FIGURE_DESCRIBE_GATE.acquire(arrival_seq, cancel_check)
     try:
         yield
     finally:
         _FIGURE_DESCRIBE_GATE.release()
+
+
+# ---- LibreOffice 转换闸门：压住本机 soffice 进程数（2026-10-14 大批量导入实踩） ----
+# 事故：编排器按篇起线程（任务总数无上限），convert 阶段原先没有闸门 → 同时转几千篇 PDF；
+# Windows 上 soffice 进程堆积到 1,647 个、单篇转换被拖到 180s 超时 → 全库判失败。
+# 语义与其余三个闸门一致：按「到达本闸门」序 FCFS，同一任务重复请求沿用同一排队号。
+_CONVERT_MAX_CONCURRENCY = max(1, _env_int("CONVERT_MAX_CONCURRENCY", 2))
+_CONVERT_GATE = _FifoGpuGate(_CONVERT_MAX_CONCURRENCY)
+
+
+# ---- SQLite/FTS 建索引闸门：压住并发写库（2026-10-14 大批量导入实踩） ----
+# 事故：fts 阶段无闸门 → 百余任务同时写同一个组 sqlite（canonical+FTS）→
+# 121 篇 OperationalError: database is locked、123 篇假死，全链完成数卡在 55 篇不动。
+# 与 convert 闸门同构：按到达序 FCFS，默认 2。
+_FTS_MAX_CONCURRENCY = max(1, _env_int("FTS_MAX_CONCURRENCY", 2))
+_FTS_GATE = _FifoGpuGate(_FTS_MAX_CONCURRENCY)
+
+
+# ---- 向量索引闸门：压住并发 embed 请求（2026-10-17 22:1x 大批量补跑实踩） ----
+# 事故：vectors 阶段无闸门 → 补跑数百篇同时进本阶段 → 数百并发 embed 请求把网关上游
+# 打出一片 502，客户端 5 次重试耗尽后降级 256 维哈希被写库维度校验拒绝（8 分钟 18 篇失败）。
+# 嵌入请求为秒级短请求，默认 8 槽足够喂满端点，同时不再打崩上游。
+_VECTORS_MAX_CONCURRENCY = max(1, _env_int("VECTORS_MAX_CONCURRENCY", 8))
+_VECTORS_GATE = _FifoGpuGate(_VECTORS_MAX_CONCURRENCY)
+
+
+@contextmanager
+def vectors_slot(
+    cancel_check: Optional[Callable[[], None]] = None,
+    arrival_seq: int = 1,
+):
+    """向量索引槽位：按到达本闸门的先后排队（本闸门独立 FCFS）。"""
+    _VECTORS_GATE.acquire(arrival_seq, cancel_check)
+    try:
+        yield
+    finally:
+        _VECTORS_GATE.release()
+
+
+@contextmanager
+def fts_slot(
+    cancel_check: Optional[Callable[[], None]] = None,
+    arrival_seq: int = 1,
+):
+    """SQLite/FTS 建索引槽位：按到达本闸门的先后排队（本闸门独立 FCFS）。"""
+    _FTS_GATE.acquire(arrival_seq, cancel_check)
+    try:
+        yield
+    finally:
+        _FTS_GATE.release()
+
+
+@contextmanager
+def convert_slot(
+    cancel_check: Optional[Callable[[], None]] = None,
+    arrival_seq: int = 1,
+):
+    """LibreOffice 转换槽位：按到达本闸门的先后排队（本闸门独立 FCFS）。"""
+    _CONVERT_GATE.acquire(arrival_seq, cancel_check)
+    try:
+        yield
+    finally:
+        _CONVERT_GATE.release()
 
 
 _POPO_TRANSIENT_MARKERS = (
@@ -702,8 +887,15 @@ def _run_vectors(ctx: StageContext) -> str:
             ctx.cancel_check()
         ctx.log_step(step, status, detail)
 
-    ks = get_docs_service()
-    ks.rebuild_document_vectors(ctx.doc_id, on_step=_on_step)
+    if _VECTORS_GATE.should_wait(ctx.arrival_seq):
+        _mark_stage_queued(
+            ctx, "向量索引排队",
+            "等待向量索引槽位（控制并发 embed 请求，避免压垮网关）",
+            "等待向量索引槽位",
+        )
+    with vectors_slot(ctx.cancel_check, arrival_seq=ctx.arrival_seq):
+        ks = get_docs_service()
+        ks.rebuild_document_vectors(ctx.doc_id, on_step=_on_step)
     import docs_core.paths as paths
     ctx.input_summary = str(paths.get_graph_jsonl_path(ctx.library_id, ctx.doc_id))
     ctx.output_summary = "vector store (entity_id + embedding)"
@@ -1223,6 +1415,14 @@ class ParseOrchestrator:
         ks.update_node(doc_id, status=overall, parse_progress=100, parse_stage=overall,
                        parse_error=parse_error)
         self._sync_record(old_task_id, doc_id, overall, parse_error)
+        if overall in ("completed", "partial"):
+            try:
+                from docs_core.step09_query.doc_search import catalog_write_enabled, refresh_doc_semantics
+
+                if catalog_write_enabled():
+                    refresh_doc_semantics(library_id, doc_id)
+            except Exception as exc:  # noqa: BLE001 —— 目录刷新失败不影响解析结果
+                logger.warning("目录语义刷新失败 doc=%s: %s", doc_id, exc)
         return {"task_id": old_task_id, "status": overall, "synced": True}
 
     def _run_parse_task(
@@ -1323,6 +1523,14 @@ class ParseOrchestrator:
             ks.update_node(doc_id, status=overall, parse_progress=100, parse_stage=overall,
                            parse_error=parse_error or None, parse_task_id=task_id)
             self._sync_record(task_id, doc_id, overall, degraded_note or None)
+            if overall in ("completed", "partial"):
+                try:
+                    from docs_core.step09_query.doc_search import catalog_write_enabled, refresh_doc_semantics
+
+                    if catalog_write_enabled():
+                        refresh_doc_semantics(library_id, doc_id)
+                except Exception as exc:  # noqa: BLE001 —— 目录刷新失败不影响解析结果
+                    logger.warning("目录语义刷新失败 doc=%s: %s", doc_id, exc)
         except ParseTaskCancelledError as exc:
             error_message = str(exc) or "用户手动取消任务"
             ks.update_parse_task(
@@ -1375,12 +1583,17 @@ class ParseOrchestrator:
             except Exception as update_exc:
                 logger.error(f"更新任务状态失败: {update_exc}")
         finally:
-            # 任务在到达 MinerU/PoPo/图描述闸门前就失败/退出时，跳过其序号，防止后续任务永久排队。
-            # 三个闸门必须补齐：任一闸门漏 skip，其 _next_seq 会永久停在死序号上，
-            # 此后所有任务都会卡在该闸门的排队状态（图描述闸门曾因漏 skip 而假死）。
+            # 任务在获槽前退出时作废其排队号（退出兜底）。新语义（按到达排队）下
+            # 未到达闸门的任务不占排位，此调用对它们是空操作；但三个闸门仍须补齐：
+            # 到达过闸门又未获槽的残余场景漏一个 skip，就会把该闸门队首永久卡住
+            # （图描述闸门曾因漏 skip 而假死）。
             _MINERU_GPU_GATE.skip(arrival_seq)
+            for _g in _ENDPOINT_GATES.values():
+                _g.skip(arrival_seq)
             _POPO_GATE.skip(arrival_seq)
+            _FTS_GATE.skip(arrival_seq)
             _FIGURE_DESCRIBE_GATE.skip(arrival_seq)
+            _CONVERT_GATE.skip(arrival_seq)
             self._threads.pop(task_id, None)
             self._cancelled.discard(task_id)
             parser = self._parsers.pop(task_id, None)

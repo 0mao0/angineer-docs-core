@@ -34,7 +34,8 @@ REGISTRY_DB_NAME = "registry.sqlite"
 STATUS_ACTIVE = "active"
 STATUS_MIGRATING = "migrating"
 STATUS_RETIRED = "retired"
-_VALID_STATUS = {STATUS_ACTIVE, STATUS_MIGRATING, STATUS_RETIRED}
+STATUS_DELETING = "deleting"
+_VALID_STATUS = {STATUS_ACTIVE, STATUS_MIGRATING, STATUS_RETIRED, STATUS_DELETING}
 
 DEFAULT_GROUP = "system"
 
@@ -136,6 +137,11 @@ def _group_defaults(group_name: str) -> Dict[str, str]:
     return {}
 
 
+def group_storage_defaults(group_name: str) -> Dict[str, str]:
+    """公开只读快照：改组保护需要判断目标组的默认 sqlite_file/collection。"""
+    return dict(_group_defaults(group_name))
+
+
 # ---- 路径解析 ----
 
 
@@ -164,8 +170,11 @@ def _connect() -> sqlite3.Connection:
 def ensure_schema(db_path: Optional[Path] = None) -> Path:
     """建库建表（幂等）。注册表只能显式初始化——纯读取不得顺手建文件（读缺失=回退，非错误）。"""
     path = db_path or resolve_registry_db_path()
-    with create_connection(path) as conn:
+    conn = create_connection(path)
+    try:
         conn.executescript(_SCHEMA)
+    finally:
+        conn.close()
     return path
 
 
@@ -341,12 +350,15 @@ def get_library(library_id: str) -> Optional[LibraryRecord]:
     """读穿查单行；注册表未初始化或无此行返回 None（调用方走回退默认）。"""
     if not _registry_exists():
         return None
-    with _connect() as conn:
+    conn = _connect()
+    try:
         row = conn.execute(
             "SELECT library_id, name, description, group_name, sqlite_file, collection, status "
             "FROM library_registry WHERE library_id=?",
             (library_id,),
         ).fetchone()
+    finally:
+        conn.close()
     return _row_to_record(row) if row is not None else None
 
 
@@ -361,8 +373,11 @@ def list_libraries(*, include_retired: bool = False) -> List[LibraryRecord]:
     if not include_retired:
         sql += " WHERE status != 'retired'"
     sql += " ORDER BY created_at ASC"
-    with _connect() as conn:
+    conn = _connect()
+    try:
         rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
     return [_row_to_record(row) for row in rows]
 
 
@@ -379,13 +394,16 @@ def get_custom_group(group_name: str) -> Optional[GroupRecord]:
     """读穿查自定义组；注册表未初始化、无 groups 表或无此行返回 None。"""
     if not _registry_exists():
         return None
-    with _connect() as conn:
+    conn = _connect()
+    try:
         if _groups_table_missing(conn):
             return None
         row = conn.execute(
             "SELECT group_name, display_name FROM library_groups WHERE group_name=?",
             (group_name,),
         ).fetchone()
+    finally:
+        conn.close()
     return GroupRecord(group_name=row["group_name"], display_name=row["display_name"]) if row else None
 
 
@@ -393,12 +411,15 @@ def list_custom_groups() -> List[GroupRecord]:
     """全部自定义组（含尚未挂库的空组）；注册表未初始化或无 groups 表返回空表。"""
     if not _registry_exists():
         return []
-    with _connect() as conn:
+    conn = _connect()
+    try:
         if _groups_table_missing(conn):
             return []
         rows = conn.execute(
             "SELECT group_name, display_name FROM library_groups ORDER BY created_at ASC"
         ).fetchall()
+    finally:
+        conn.close()
     return [GroupRecord(group_name=r["group_name"], display_name=r["display_name"]) for r in rows]
 
 
@@ -491,6 +512,7 @@ __all__ = [
     "LibraryRecord",
     "REGISTRY_DB_ENV",
     "STATUS_ACTIVE",
+    "STATUS_DELETING",
     "STATUS_MIGRATING",
     "STATUS_RETIRED",
     "create_group",

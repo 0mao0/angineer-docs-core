@@ -35,6 +35,61 @@ def normalize_query(query: str) -> str:
     return normalize_chinese_clause_numbers(query)
 
 
+def _tag_item_libraries(items: List[Any], nodes: Optional[List[Any]]) -> int:
+    """逐条回填 item.metadata["library_id"]（多库集合下条目的库归属）。
+
+    引擎侧按这份库标回填引用与证据的库归属：前端点引用用 citation.library_id 取文档，
+    缺标时只能回退会话首库——非首库的文档必 404「Document not found」
+    （2026-10-16 本地 6 库会话实踩：PDF 在 std-water、回退 std-highway）。
+    HTTP 多库通道（retrieve_service._retrieve_multi）早有同样的打标，本地进程内通道此前没有。
+
+    归属只取节点/meta 库的事实，取不到就不标：宁可不标（前端回退，与修复前同行为），
+    也不按首库猜——误标会同时把 evidence.library_id 写错。
+    """
+    mapping: Dict[str, str] = {}
+    unresolved: List[str] = []
+    for node in nodes or []:
+        doc_id = str(getattr(node, "id", "") or "").strip()
+        if not doc_id:
+            continue
+        lib = str(getattr(node, "library_id", "") or "").strip()
+        if lib:
+            mapping[doc_id] = lib
+        else:
+            unresolved.append(doc_id)
+    if unresolved:
+        # 外部注入/旧装配的节点可能不带库标：按 meta 库读穿一次（同 _retrieve_multi 的归属分桶）
+        try:
+            from docs_core.docs_service import get_docs_service
+
+            meta_store = get_docs_service().meta_store
+        except Exception:  # noqa: BLE001 — 服务不可用只是不标，不拖垮检索
+            meta_store = None
+        if meta_store is not None:
+            for doc_id in unresolved:
+                try:
+                    lib = str(meta_store.get_node_library_id(doc_id) or "").strip()
+                except Exception:  # noqa: BLE001 — 单条读失败只跳过该条
+                    lib = ""
+                if lib:
+                    mapping[doc_id] = lib
+    tagged = 0
+    for item in items:
+        if isinstance(item, dict):
+            metadata = item.get("metadata")
+            doc_id = str(item.get("doc_id") or "")
+        else:
+            metadata = getattr(item, "metadata", None)
+            doc_id = str(getattr(item, "doc_id", "") or "")
+        if not isinstance(metadata, dict):
+            continue
+        lib = mapping.get(doc_id)
+        if lib:
+            metadata["library_id"] = lib
+            tagged += 1
+    return tagged
+
+
 def knowledge_local_search(
     *,
     query: str,
@@ -157,9 +212,113 @@ def knowledge_local_search(
             full = table_text_by_id.get(tid) or ""
             if full and len(full) > len(str(item.text or "")):
                 item.text = full
+    # 多库集合逐条回填库标：引用/证据按库定位的真相源（缺标即前端回退会话首库 → 非首库 404）
+    _tag_item_libraries(items, nodes)
     # stage_times 随返回值上浮：引擎层（agent_tools）选择性消费后落 ops jsonl，
     # docs-core 不感知观测设施（req-table-retrieval-latency §10 方案 E）。
     return {"items": items, "stage_times": dict(stage_times)}
+
+
+def _merge_header_rows(header: List[Any]) -> List[str]:
+    """多行表头压成一行：每列非空单元格按顺序拼接。
+
+    财务表常见两行表头（「Fiscal Year / Fiscal Year / Fiscal Year」+「2019 / 2018 / 2017」），
+    原样输出会得到三列同名「Fiscal Year」，模型无法把数值对到年份列；压成
+    「Fiscal Year 2019 | Fiscal Year 2018 | Fiscal Year 2017」后列义唯一。
+    """
+    cols: List[str] = []
+    for row in header:
+        cells = row if isinstance(row, (list, tuple)) else [row]
+        for i, cell in enumerate(cells):
+            text = str(cell).strip()
+            if not text:
+                continue
+            while len(cols) <= i:
+                cols.append("")
+            cols[i] = f"{cols[i]} {text}".strip()
+    return [c or "（行标签）" for c in cols]
+
+
+def _table_block_text(block: Dict[str, Any]) -> str:
+    """表格块 → 可进证据的文本：表题 + 单行合并表头 + 每行数据独占一行。
+
+    列序固定为表头顺序；数据行不再与表头拼行（2026-10-21 复核：早期"表头并进首行"
+    是打印时替换换行造成的错觉，实际渲染本就是逐行；这里只修「多行表头列义重复」）。
+    """
+    rows = block.get("rows") or []
+    header = block.get("header_rows") or []
+    ctx = str(block.get("context") or "").strip()
+    head = (f"表格《{ctx}》包含 {len(rows)} 行" if ctx else f"表格包含 {len(rows)} 行")
+    lines = [head]
+    merged = _merge_header_rows(header)
+    if merged:
+        lines.append("列：" + " | ".join(merged))
+    for idx, row in enumerate(rows, 1):
+        cells = row if isinstance(row, (list, tuple)) else [row]
+        lines.append(f"{idx}. " + " | ".join(str(c).strip() for c in cells))
+    return "\n".join(lines)
+
+
+def _query_tokens(query: str) -> List[str]:
+    """检索词：全量去重（不截前 20 个）——财务题的公式行项常出现在题干尾部，
+    截断会丢掉 inventory/receivable/payable 这些唯一能与表头对上的词。"""
+    import re
+
+    seen, out = set(), []
+    for tok in re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", (query or "").lower()):
+        if len(tok) < 3 or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if len(out) >= 40:
+            break
+    return out
+
+
+def _doc_scoped_table_blocks(
+    items: List[Any], *, query: str, library_id: str,
+    doc_ids: Optional[List[str]], top_k: int,
+) -> List[Any]:
+    """doc 范围明确、但候选里没有「带行」的表时，直接按该文档 canonical 表格块补候选。
+
+    2026-10-21 实踩：financebench 财务比率题原文（CCC/DIO/DSO/DPO）与利润表表头零词面
+    交集，table_search 把 32 行利润表排到 12 条之外，模型只拿到 chunk 摘要、没有行数值，
+    只能拒答。表本身在索引里（换 query "Cost of sales" 即命中），这里按 doc 范围兜底：
+    词面命中的表优先，其余按原文顺序补足。兜底失败不影响主检索。
+    """
+    if not doc_ids or any(str(getattr(it, "entity_type", "") or "") == "table" for it in items):
+        return items
+    try:
+        blocks = table_blocks_provider(library_id=library_id, doc_ids=list(doc_ids))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("doc 范围表格兜底失败: %s", exc)
+        return items
+    if not blocks:
+        return items
+    tokens = _query_tokens(query)
+    scored = []
+    for idx, block in enumerate(blocks):
+        text = _table_block_text(block)
+        score = sum(1 for t in tokens if t in text.lower())
+        scored.append((score, idx, text, block))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    from .protocols.contracts import RetrievedItem
+
+    extra = []
+    for score, idx, text, block in scored[: max(1, min(int(top_k or 20), 8))]:
+        extra.append(RetrievedItem(
+            item_id=f"table-block-{block.get('doc_id', '')}-{block.get('page_idx', idx)}-{idx}",
+            entity_type="table",
+            doc_id=str(block.get("doc_id") or ""),
+            title=str(block.get("context") or "")[:120],
+            text=text,
+            score=float(score),
+            retrieval_policy="doc_table_fallback",
+            metadata={"page_idx": block.get("page_idx"), "fallback": "doc_table"},
+        ))
+    if extra:
+        logger.info("table_search doc 范围兜底：补 %d 张表（doc_ids=%s）", len(extra), doc_ids)
+    return list(items) + extra
 
 
 def table_local_search(
@@ -223,6 +382,8 @@ def table_local_search(
         return {"error": "表格检索全部失败", "detail": {k: v for k, v in sources.items() if k.endswith("_error")}}
     _t = time.perf_counter()
     items, _debug = fuse_candidates(candidate_sources, task_type="table_qa", top_k=top_k)
+    items = _doc_scoped_table_blocks(
+        items, query=query, library_id=library_id, doc_ids=doc_ids, top_k=top_k)
     stage_times["fuse"] = time.perf_counter() - _t
     logger.info(
         "table_search 分段计时(本地召回): %s items=%d query=%r",
@@ -230,6 +391,8 @@ def table_local_search(
         len(items),
         query[:40],
     )
+    # 逐条回填库标（同 knowledge_local_search：表格条目的引用/证据也要能按库定位）
+    _tag_item_libraries(items, nodes)
     # stage_times 随返回值上浮（同 knowledge_local_search，方案 E）
     return {"items": items, "stage_times": dict(stage_times)}
 
@@ -241,13 +404,12 @@ def entity_local_search(
     db_path: Optional[str] = None,
     limit: int = 20,
 ) -> List[Any]:
-    """图谱本地直查（GraphStore 分支）。db_path 缺省按仓库根解析
-    （容器里 cwd 是 services/aichat-api，不能用 cwd 相对）。平移自
-    RetrieverAdapter.entity_search 本地分支，逻辑零改动。"""
-    from ..paths import resolve_graph_db_path
+    """图谱本地直查（GraphStore 分支）。db_path 缺省按 **library_id 的库文件**解析
+    （plan-graph-per-library-split；迁移期自动回退全局文件）。"""
+    from ..step07_graph.graph_files import resolve_graph_db_for_library
     from ..step07_graph.graph_store import GraphStore
 
-    graph_db = db_path or str(resolve_graph_db_path())
+    graph_db = db_path or str(resolve_graph_db_for_library(library_id))
     store = GraphStore(db_path=graph_db)
     return store.search_entities(query, limit=limit, library_id=library_id)
 
@@ -355,9 +517,19 @@ def local_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
     finally:
         rconn.close()
 
+    matters: Dict[str, Any] = {"catalog": False, "total": 0, "matters": []}
+    if library_id:
+        try:
+            from .doc_search import list_matters
+
+            matters = list_matters(library_id)
+        except Exception:  # noqa: BLE001
+            pass
+
     return {
         "library_id": library_id,
         "generated_at": now.isoformat(),
+        "matters": matters,
         "documents": {
             "total": total,
             "deleted": deleted,
@@ -392,15 +564,18 @@ def local_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-def relevant_citations(query: str, items: list, limit: int = 5) -> List[Dict[str, Any]]:
-    """从融合候选中挑选"真正有用"的引用：查询短语精确命中优先，无命中时按重排分取前 limit 条。
+def relevant_citations(query: str, items: list, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """从融合候选中挑选引用：短语精确命中优先。
 
-    平移自 angineer_core.agent_tools._build_relevant_citations，逻辑零改动。
+    limit=None/<=0 返回**全部** items——引用解析表必须覆盖所有 cite 标记，
+    否则答案引用第 6 条以后的证据时前端无法解析、回退显示 doc_id（2026-10-22 实踩）。
+    limit>0 保持旧语义（只取命中项/前 limit 条，供展示型调用）。
     """
     if not items:
         return []
     from .retrieval.query_normalizer import build_query_phrases, normalize_match_text
 
+    cap = len(items) if limit is None or int(limit) <= 0 else min(int(limit), len(items))
     query_phrases = build_query_phrases(query)
     selected: List[Any] = []
     if query_phrases:
@@ -410,9 +585,14 @@ def relevant_citations(query: str, items: list, limit: int = 5) -> List[Dict[str
             if any(phrase in compact for phrase in query_phrases):
                 phrase_hits.append(item)
         if phrase_hits:
-            selected = phrase_hits[:limit]
+            if limit is None or int(limit) <= 0:
+                hit_ids = {id(item) for item in phrase_hits}
+                selected = phrase_hits + [item for item in items if id(item) not in hit_ids]
+                selected = selected[:cap]
+            else:
+                selected = phrase_hits[:cap]
     if not selected:
-        selected = items[:limit]
+        selected = items[:cap]
 
     citations: List[Dict[str, Any]] = []
     for item in selected:
@@ -452,13 +632,17 @@ def table_blocks_provider(
     """
     from ..docs_service import docs_service
 
+    # 按库解析组存储（多库修复 2026-10-13：原用全局单例 canonical_store，永远指向本服务
+    # 默认库——非 default 库（如 std-water→standards 组）的表格在库范围内永远取不到）。
+    canonical = docs_service._canonical_store_for(library_id)
+
     if not doc_ids:
         nodes = docs_service.list_nodes(library_id)
         doc_ids = [n.id for n in nodes if getattr(n, "type", "") == "document"]
     out: List[Dict[str, Any]] = []
     for doc_id in doc_ids:
         try:
-            tables = docs_service.canonical_store.list_tables(doc_id, limit=500)
+            tables = canonical.list_tables(doc_id, limit=500)
         except Exception as exc:  # noqa: BLE001
             logger.warning("读取文档表格失败 doc_id=%s: %s", doc_id, exc)
             continue

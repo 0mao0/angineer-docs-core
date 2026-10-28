@@ -350,6 +350,14 @@ class DocsService:
         """doc→library 读穿反查（meta nodes 主键命中）。"""
         return self.meta_store.get_node_library_id(doc_id)
 
+    def get_doc_library_id(self, doc_id: str) -> Optional[str]:
+        """doc→library 反查公开入口（知识树懒加载聚焦：先定位所属库，再按库载入树）。"""
+        return self._library_of_doc(doc_id)
+
+    def search_nodes_by_title(self, keyword: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """全库标题搜索（懒加载树的远端搜索通道：未展开库的命中在此返回，前端点击时按库拉取）。"""
+        return self.meta_store.search_nodes_by_title(keyword, limit)
+
     def _canonical_store_for_doc(self, doc_id: str) -> CanonicalSQLiteStore:
         return self._canonical_store_for(self._library_of_doc(doc_id))
 
@@ -459,6 +467,15 @@ class DocsService:
     def reload_scope_cache(self) -> None:
         self._load_from_db()
 
+    def forget_library_stores(self, library_id: str) -> None:
+        """删库前丢弃该库的 store 缓存引用；Windows 下缓存对象可能仍持有 sqlite 句柄。"""
+        try:
+            key = str(library_registry.resolve_index_db_path(library_id))
+        except Exception:  # noqa: BLE001
+            return
+        self._canonical_stores.pop(key, None)
+        self._index_stores.pop(key, None)
+
     # 删除指定节点集合
     def _delete_nodes(self, node_ids: List[str]) -> None:
         self.meta_store.delete_nodes(node_ids)
@@ -497,14 +514,14 @@ class DocsService:
                 node.id, collection=self._collection_for_library(node.library_id)
             )
             file_storage.delete_document(node.library_id, node.id)
-            self._delete_document_graph_data(node.id)
+            self._delete_document_graph_data(node.library_id, node.id)
 
-    # 清理 knowledge_graph.sqlite 中该文档的图谱产物（entities 为全局共享，保留）。
-    def _delete_document_graph_data(self, doc_id: str) -> None:
+    # 清理该文档在其库图谱文件中的产物（plan-graph-per-library-split：一库一文件）。
+    def _delete_document_graph_data(self, library_id: str, doc_id: str) -> None:
         try:
-            from docs_core.paths import resolve_graph_db_path
+            from docs_core.step07_graph.graph_files import resolve_graph_db_for_library
             from docs_core.step07_graph.graph_store import GraphStore
-            graph_db = resolve_graph_db_path()
+            graph_db = resolve_graph_db_for_library(library_id)
             if graph_db.exists():
                 GraphStore(str(graph_db)).delete_document(doc_id)
         except Exception as exc:
@@ -608,6 +625,25 @@ class DocsService:
         library = self.get_library(library_id)
         if library is None:
             return None
+        if group_name is not None and group_name != library.group_name:
+            old_rec = library_registry.get_library(library_id)
+            defaults = library_registry.group_storage_defaults(group_name)
+            if old_rec is not None and defaults:
+                with self.meta_store.connect() as conn:
+                    nonempty = conn.execute(
+                        "SELECT 1 FROM nodes WHERE library_id=? AND type='document' "
+                        "AND COALESCE(deleted,0)=0 LIMIT 1",
+                        (library_id,),
+                    ).fetchone()
+                new_bucket = (defaults.get("sqlite_file"), defaults.get("collection"))
+                old_bucket = (old_rec.sqlite_file, old_rec.collection)
+                if nonempty and old_bucket != new_bucket:
+                    raise ValueError(
+                        "非空库不能跨桶改组（旧桶 "
+                        f"{old_bucket[0]}/{old_bucket[1]} → 新桶 "
+                        f"{new_bucket[0]}/{new_bucket[1]}）；"
+                        "请先迁移数据或保持同桶"
+                    )
         if name is not None:
             library.name = name
         if description is not None:
@@ -671,28 +707,13 @@ class DocsService:
 
     # 删除知识库：级联清理该库全部节点、文档产物、图谱数据与库记录。default 禁止删除。
     def delete_library(self, library_id: str) -> bool:
-        if library_id == "default" or self.get_library(library_id) is None:
+        from docs_core.library_delete import delete_library_data
+
+        try:
+            delete_library_data(self, library_id)
+        except Exception:  # noqa: BLE001 — 保持旧入口的 bool 契约；详情由调用方日志查看
+            logger.exception("删除知识库失败: %s", library_id)
             return False
-        library_nodes = [node for node in self.nodes if node.library_id == library_id]
-        library_node_ids = [node.id for node in library_nodes]
-        document_nodes = [node for node in library_nodes if node.type == "document"]
-        self._purge_document_artifacts(document_nodes)
-        self.nodes = [node for node in self.nodes if node.library_id != library_id]
-        self.meta_store.delete_nodes(library_node_ids)
-        self.libraries = [library for library in self.libraries if library.id != library_id]
-        self.meta_store.delete_library(library_id)
-        try:
-            library_registry.set_status(library_id, library_registry.STATUS_RETIRED)
-        except Exception as exc:
-            logger.warning("注册表置 retired 失败: library=%s err=%s", library_id, exc)
-        try:
-            from docs_core.paths import resolve_graph_db_path
-            from docs_core.step07_graph.graph_store import GraphStore
-            graph_db = resolve_graph_db_path()
-            if graph_db.exists():
-                GraphStore(str(graph_db)).delete_library(library_id)
-        except Exception as exc:
-            logger.warning("清理知识库 %s 的图谱数据失败: %s", library_id, exc)
         return True
 
     # 获取知识库节点列表（读穿：现查 SQLite——新建库/新导文档对运行中的读方进程立即可见；

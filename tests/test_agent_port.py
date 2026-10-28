@@ -123,6 +123,29 @@ class TestRelevantCitations:
     def test_empty_items(self):
         assert agent_port.relevant_citations("任意", []) == []
 
+    def test_default_covers_all_markers(self):
+        """默认 limit=None：解析表必须覆盖全部 cite（2026-10-22 答案引用 K6+ 回退 doc_id）。"""
+        items = [
+            RetrievedItem(item_id=f"i{i}", entity_type="content", doc_id=f"d{i}", title=f"t{i}",
+                          text=("船闸规范 闸门" if i == 10 else "海港 航道") + f" 第{i}条",
+                          score=1.0, metadata={"cite": f"K{i}"})
+            for i in range(1, 16)
+        ]
+        citations = agent_port.relevant_citations("船闸规范", items)
+        assert len(citations) == 15
+        assert {c["marker"] for c in citations} == {f"K{i}" for i in range(1, 16)}
+        assert citations[0]["marker"] == "K10"  # 短语命中优先，其余按原顺序
+
+    def test_explicit_limit_keeps_display_semantics(self):
+        items = [
+            RetrievedItem(item_id=f"i{i}", entity_type="content", doc_id=f"d{i}", title=f"t{i}",
+                          text=("船闸规范" if i in (1, 2) else "海港") + f" 第{i}条",
+                          score=1.0, metadata={"cite": f"K{i}"})
+            for i in range(1, 6)
+        ]
+        citations = agent_port.relevant_citations("船闸规范", items, limit=5)
+        assert len(citations) == 2  # 旧语义：只取命中项
+
 
 class TestLocalStatsTitles:
     def _build_dbs(self, tmp_path, doc_count):
@@ -202,3 +225,107 @@ def test_knowledge_local_search_passes_library_ids():
     assert captured  # 三路检索器均被调用
     assert all(request.library_ids == ["libA", "libB"] for request in captured)
     assert all(request.library_id == "libA" for request in captured)
+
+
+class TestItemLibraryTags:
+    """逐条库标回填（2026-10-16 引用 404 修复）：多库会话里条目必须自带库归属，
+    否则引擎侧引用/证据只能回退会话首库，非首库文档必 404「Document not found」。"""
+
+    class _Items:
+        def __init__(self, items):
+            self._items = items
+
+        def retrieve(self, *args, **kwargs):
+            return list(self._items)
+
+    class _Empty:
+        def retrieve(self, *args, **kwargs):
+            return []
+
+    @staticmethod
+    def _nodes():
+        from types import SimpleNamespace
+
+        # 两个库的节点：doc-a 在 libA（会话首库），doc-b 在 libB（非首库）
+        return [
+            SimpleNamespace(id="doc-a", library_id="libA", type="document"),
+            SimpleNamespace(id="doc-b", library_id="libB", type="document"),
+        ]
+
+    @staticmethod
+    def _item(doc_id, cite):
+        return RetrievedItem(
+            item_id=f"chunk-{doc_id}:1:1", entity_type="paragraph", doc_id=doc_id,
+            title="t", text=f"《规范》{cite} 正文", score=1.0, rerank_score=0.9,
+            metadata={"cite": cite},
+        )
+
+    def test_knowledge_items_tagged_by_node_library(self):
+        from docs_core.step09_query import agent_port
+
+        items = [self._item("doc-a", "K1"), self._item("doc-b", "K2")]
+        result = agent_port.knowledge_local_search(
+            query="内河航道养护有什么技术要求", library_id="libA",
+            library_ids=["libA", "libB"], top_k=20, task_type="content_qa",
+            nodes=self._nodes(), dense=self._Items(items), sparse=self._Empty(), clause=self._Empty(),
+        )
+        tagged = {item.doc_id: item.metadata.get("library_id") for item in result["items"]}
+        assert tagged.get("doc-a") == "libA"
+        assert tagged.get("doc-b") == "libB"
+
+    def test_table_items_tagged_by_node_library(self):
+        from docs_core.step09_query import agent_port
+
+        result = agent_port.table_local_search(
+            query="航道维护尺度 取值", library_id="libA", top_k=20,
+            nodes=self._nodes(), table=self._Items([self._item("doc-b", "T1")]), formula=self._Empty(),
+        )
+        assert result["items"][0].metadata.get("library_id") == "libB"
+
+    @staticmethod
+    def _patch_docs_service(monkeypatch, fake):
+        """补丁打在真模块上：包属性 `docs_core.docs_service` 是单例代理，
+        而适配器走 `from docs_core.docs_service import get_docs_service`（取真模块）。"""
+        import sys
+
+        import docs_core.docs_service  # noqa: F401 — 确保真模块已进 sys.modules
+
+        monkeypatch.setattr(sys.modules["docs_core.docs_service"], "get_docs_service", fake)
+
+    def test_unknown_doc_not_tagged_with_first_library(self, monkeypatch):
+        """取不到归属宁可不标：按首库猜会把引用与证据的库归属一起写错。"""
+        from docs_core.step09_query import agent_port
+        from types import SimpleNamespace
+
+        self._patch_docs_service(
+            monkeypatch,
+            lambda: (_ for _ in ()).throw(RuntimeError("meta 库不可用")),
+        )
+        result = agent_port.knowledge_local_search(
+            query="内河航道养护有什么技术要求", library_id="libA",
+            library_ids=["libA", "libB"], top_k=20, task_type="content_qa",
+            nodes=[SimpleNamespace(id="doc-x", type="document")],  # 节点不带库标
+            dense=self._Items([self._item("doc-x", "K1")]), sparse=self._Empty(), clause=self._Empty(),
+        )
+        assert "library_id" not in result["items"][0].metadata
+
+    def test_node_without_library_reads_through_meta_store(self, monkeypatch):
+        """外部注入节点可能不带库标：读 meta 库穿一次（同 retrieve_service._retrieve_multi）。"""
+        from docs_core.step09_query import agent_port
+        from types import SimpleNamespace
+
+        class _Meta:
+            def get_node_library_id(self, doc_id):
+                return "libB" if doc_id == "doc-b" else ""
+
+        self._patch_docs_service(
+            monkeypatch,
+            lambda: SimpleNamespace(meta_store=_Meta()),
+        )
+        result = agent_port.knowledge_local_search(
+            query="内河航道养护有什么技术要求", library_id="libA",
+            library_ids=["libA", "libB"], top_k=20, task_type="content_qa",
+            nodes=[SimpleNamespace(id="doc-b", type="document")],
+            dense=self._Items([self._item("doc-b", "K1")]), sparse=self._Empty(), clause=self._Empty(),
+        )
+        assert result["items"][0].metadata.get("library_id") == "libB"

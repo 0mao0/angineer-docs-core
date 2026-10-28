@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -47,6 +48,37 @@ def _popo_endpoint_failures(text: str) -> List[str]:
     contd 有 245 篇是"问了却回空"）。它唯一的痕迹就是那行 `print`，必须显式捞出来。
     """
     return _POPO_ENDPOINT_FAILURE_RE.findall(text or "")
+
+
+def _pick_weighted_popo_configs() -> str:
+    """按 POPO_ENDPOINT_WEIGHTS 抽一个端点，返回单条 POPO_CONFIGS JSON 列表。
+
+    2026-10-26 M5 切 popo-client（公开库）后加权轮询的宿主（dgx-spark-popo 计划 §2/F1）：
+    库内只保留顺序 failover，配比在调用方实现——每文档按权重抽一次端点。
+    旧 vendored 实现是子进程内请求级游标，粒度更细；对 dgx:1,company:3 这类
+    比例，文档级抽样与请求级配比在聚合上收敛一致，且不把权重逻辑带进公开库。
+    权重缺失/非法时原样透传 POPO_CONFIGS（多端点顺序 failover，库默认行为）。
+    """
+    raw_configs = os.environ.get("POPO_CONFIGS", "").strip()
+    raw_weights = os.environ.get("POPO_ENDPOINT_WEIGHTS", "").strip()
+    if not raw_configs or not raw_weights:
+        return raw_configs
+    try:
+        configs = json.loads(raw_configs)
+        if not isinstance(configs, list) or not configs:
+            return raw_configs
+        table = {}
+        for part in raw_weights.split(","):
+            if ":" in part:
+                k, _, v = part.partition(":")
+                table[k.strip()] = max(1, int(v))
+        if not table:
+            return raw_configs
+        weights = [table.get(c.get("name", ""), 1) for c in configs]
+        picked = random.choices(configs, weights=weights, k=1)[0]
+        return json.dumps([picked], ensure_ascii=False)
+    except Exception:
+        return raw_configs
 
 
 def _count_popo_verdicts(enriched_dir: Path, doc_id: str) -> Dict[str, int]:
@@ -125,6 +157,12 @@ class PoPoPipelineRunner:
                     src_root / "popo",
                     src_root / "docs_core" / "popo",
                 ]
+                # 已安装的 popo 包（pip 装的 popo-client，容器内无 .env 时的主路径）
+                try:
+                    import popo as _popo_pkg
+                    candidates.insert(0, Path(list(_popo_pkg.__path__)[0]))
+                except ImportError:
+                    pass
                 self.popo_repo_path = next(
                     (c for c in candidates if (c / "post_processing" / "label_normalization.py").exists()),
                     None,
@@ -234,12 +272,110 @@ class PoPoPipelineRunner:
         """
         tmp_dir = tempfile.mkdtemp(prefix="popo-")
         try:
+            doc_api_url = os.environ.get("POPO_DOC_API_URL", "").strip()
+            if doc_api_url:
+                return self._run_doc_api(
+                    doc_api_url, mineru_raw_dir, output_dir, doc_id,
+                    source_pdf_path, source_dir, on_step,
+                )
             return self._run_stages(
                 mineru_raw_dir, output_dir, tmp_dir, doc_id,
                 source_pdf_path, source_dir, on_step, cancel_check,
             )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _run_doc_api(
+        self, base_url: str, mineru_raw_dir: str, output_dir: str, doc_id: str,
+        source_pdf_path: str, source_dir: Optional[str],
+        on_step: Optional[Callable[[str, str, str], None]],
+    ) -> Dict[str, Any]:
+        """文档级 API 模式（dgx-spark-popo server/，2026-10-26 起）：一次 HTTP 拿判定+树。
+
+        链路（归一化→推理→构树）整体在服务端跑；本侧只剩编排与落盘。
+        未设 POPO_DOC_API_URL 时回落子进程链模式（wheel），两条路产物同构。
+        注意：cancel_check 在本模式不生效（requests 阻塞等待），超时由 POPO_DOC_TIMEOUT 控制。
+        """
+        import requests
+
+        api_key = os.environ.get("POPO_DOC_API_KEY", "").strip()
+        timeout = int(os.environ.get("POPO_DOC_TIMEOUT", "1800"))
+
+        raw = Path(mineru_raw_dir)
+        middle = raw / "middle.json"
+        if not middle.is_file():
+            middle = raw / "content_list.json"
+        if not middle.is_file():
+            _emit_on_step(on_step, "PoPo 输入准备", "failed", "缺少 middle.json / content_list.json")
+            raise FileNotFoundError(f"no middle.json under {raw}")
+
+        pdf = self._resolve_pdf(source_pdf_path, source_dir)
+        if pdf is None:
+            _emit_on_step(on_step, "PoPo 输入准备", "failed", "未找到源 PDF")
+            raise FileNotFoundError("no source pdf")
+        _emit_on_step(on_step, "PoPo 输入准备", "done", str(pdf))
+
+        try:
+            with open(pdf, "rb") as f_pdf, open(middle, "rb") as f_mid:
+                resp = requests.post(
+                    f"{base_url.rstrip('/')}/v1/enhance",
+                    files={"pdf": (pdf.name, f_pdf, "application/pdf"),
+                           "middle": (middle.name, f_mid, "application/json")},
+                    data={"doc_id": doc_id},
+                    headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+                    timeout=timeout,
+                )
+        except requests.RequestException as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:160]}"
+            _emit_on_step(on_step, "PoPo 4B 推理", "failed", detail)
+            raise PopoEndpointUnavailableError(f"PoPo 文档级 API 不可达（{detail}）") from exc
+        if resp.status_code == 401:
+            _emit_on_step(on_step, "PoPo 4B 推理", "failed", "401 鉴权失败")
+            raise PopoEndpointUnavailableError("PoPo 文档级 API 鉴权失败（检查 POPO_DOC_API_KEY）")
+        if resp.status_code != 200:
+            detail = resp.text[:200]
+            _emit_on_step(on_step, "PoPo 4B 推理", "failed", f"HTTP {resp.status_code}")
+            raise PopoEndpointUnavailableError(f"PoPo 文档级 API 返回 {resp.status_code}: {detail}")
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise PopoEndpointUnavailableError("PoPo 文档级 API 返回非 JSON") from exc
+
+        blocks = payload.get("enriched_blocks") or []
+        verdicts = {
+            "blocks": len(blocks),
+            "contd": sum(1 for b in blocks if b.get("contd", -1) >= 0),
+            "level": sum(1 for b in blocks if b.get("level", -1) >= 0),
+            "image": sum(1 for b in blocks if b.get("image", -1) >= 0),
+        }
+        if verdicts["blocks"] == 0:
+            raise PopoEndpointUnavailableError("PoPo 文档级 API 返回零判定块")
+        _emit_on_step(on_step, "PoPo 4B 推理", "done",
+                      f"判定 contd {verdicts['contd']} / level {verdicts['level']} / "
+                      f"image {verdicts['image']}（{verdicts['blocks']} 块，服务端 {payload.get('seconds')}s）")
+        _emit_on_step(on_step, "document tree 构建", "done", "")
+
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        final_enriched = str(out / "enriched_blocks.json")
+        final_tree = str(out / "document_tree.json")
+        Path(final_enriched).write_text(
+            json.dumps(payload.get("enriched_blocks"), ensure_ascii=False), encoding="utf-8")
+        Path(final_tree).write_text(
+            json.dumps(payload.get("document_tree"), ensure_ascii=False), encoding="utf-8")
+        _emit_on_step(on_step, "enriched_blocks.json 落盘", "done", final_enriched)
+        return {
+            "enriched_blocks_path": final_enriched,
+            "document_tree_path": final_tree,
+        }
+
+    def _resolve_pdf(self, source_pdf_path: str, source_dir: Optional[str]) -> Optional[Path]:
+        candidates = []
+        if source_pdf_path:
+            candidates.append(Path(source_pdf_path))
+        if source_dir:
+            candidates.extend(sorted(Path(source_dir).glob("*.pdf")))
+        return next((c for c in candidates if c.is_file()), None)
 
     def _run_stages(
         self, mineru_raw_dir: str, output_dir: str, tmp_dir: str, doc_id: str,
@@ -255,6 +391,8 @@ class PoPoPipelineRunner:
 
         env = os.environ.copy()
         env["PYTHONPATH"] = str(self.popo_repo_path) + os.pathsep + env.get("PYTHONPATH", "")
+        # F1 宿主迁移：公开库只做顺序 failover，端点配比在此按文档粒度选定
+        env["POPO_CONFIGS"] = _pick_weighted_popo_configs()
 
         # ---- Step 1: Label Normalization ----
         # MineruReader 官方优先读 model.json，但公司 API 的 model.json layout_dets
@@ -356,15 +494,18 @@ class PoPoPipelineRunner:
             raise
         # 非空校验：端点全挂时 popo_generate 只 return ""、退出码仍是 0，阶段会被记成 done
         # 而产物里一个判定都没有。这里把它变成显式失败（popo 是 soft 阶段，不影响后续解析）。
+        # 2026-10-16 修正：旧版只要 stdout 出现一条 "POPO endpoint X failed" 就判失败——
+        # 多端点容错下会误杀（company 连不上、DGX 成功产出判定，整篇仍被标 failed，当天 PoPo
+        # 零产出 12h 的真因）。改为先数产物：有判定=成功（端点失败只是容错噪音）；零判定才失败。
+        verdicts = _count_popo_verdicts(enriched_out, doc_id)
         failed_endpoints = _popo_endpoint_failures(infer_output)
-        if failed_endpoints:
+        if failed_endpoints and verdicts["blocks"] == 0:
             detail = f"端点失败 {len(failed_endpoints)} 次：{failed_endpoints[0]}"
             _emit_on_step(on_step, "PoPo 4B 推理", "failed", detail)
             raise PopoEndpointUnavailableError(
                 f"PoPo 推理端点全部失败，本文档没有可用判定（{detail}）"
                 "；历史行为是静默返回空串、阶段记 done，故此前一直不可见"
             )
-        verdicts = _count_popo_verdicts(enriched_out, doc_id)
         logger.info("PoPo 判定产出: %s", verdicts)
         _emit_on_step(
             on_step,

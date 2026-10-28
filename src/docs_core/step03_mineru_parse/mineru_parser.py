@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from typing import Optional, Dict, Any, List, Callable
 from pathlib import Path
 from dotenv import load_dotenv
@@ -149,7 +150,22 @@ class MinerUParser:
         self.max_download_bytes = max(1, int(os.getenv('MINERU_DOWNLOAD_MAX_BYTES', str(1 << 30))))
         self.max_uncompressed_bytes = max(1, int(os.getenv('MINERU_UNCOMPRESSED_MAX_BYTES', str(4 << 30))))
         self.company_api_timeout = max(30, int(os.getenv('MINERU_COMPANY_API_TIMEOUT', '600')))
+        # 连接阶段超时独立于读取超时（2026-10-13 实踩：单值 3600 同时充当 connect 超时，
+        # 死端点（tailscale 直连不可达）每篇文档空挂满 1 小时才切下一端点——完成数停走 3 小时。
+        # 连接阶段必须秒级判定：connect=15s，读取（大册解析）才用 company_api_timeout。
+        self.connect_timeout = max(3, int(os.getenv('MINERU_CONNECT_TIMEOUT', '15')))
+        # 端点级熔断：连接级失败（Connection/timed out/Max retries）的端点近期直接跳过，
+        # 避免同一死端点在全队列上反复空耗；TTL 后自动重试探测恢复。
+        self.endpoint_down_ttl = max(30, int(os.getenv('MINERU_ENDPOINT_DOWN_TTL', '600')))
+        self._endpoint_down_until: Dict[str, float] = {}
         self._abort_event = threading.Event()
+        # 端点偏好（2026-10-14 端点分流）：由编排层按权重分配后写入；非空时该端点排到
+        # 尝试顺序最前，其余端点仍作失败回退（不改变"逐个试"语义）。
+        self.preferred_endpoint: Optional[str] = None
+        # 端点槽位钩子（编排层注入）：slot_acquire(name) 阻塞取该端点额度（可取消），
+        # slot_release(name) 释放；None = 不限并发（脚本/测试裸用解析器时）。
+        self.slot_acquire: Optional[Callable[[str], None]] = None
+        self.slot_release: Optional[Callable[[str], None]] = None
 
     def _load_endpoints(self) -> List[Dict[str, Any]]:
         """从 MINERU_CONFIGS (JSON list) 加载端点，全部走 file_parse ZIP 协议。
@@ -603,10 +619,32 @@ class MinerUParser:
         if not self.endpoints:
             return self._build_parse_result(False, error="MinerU: 未配置解析端点 (MINERU_CONFIGS)")
         attempts: List[Dict[str, Any]] = []
-        for ep in self.endpoints:
+        # 端点偏好优先，其余保持 MINERU_CONFIGS 顺序作回退
+        endpoints = self.endpoints
+        pref = (self.preferred_endpoint or "").strip()
+        if pref:
+            preferred = [ep for ep in self.endpoints if str(ep.get("name") or "") == pref]
+            if preferred:
+                endpoints = preferred + [ep for ep in self.endpoints if str(ep.get("name") or "") != pref]
+        for ep in endpoints:
             if self._abort_event.is_set():
                 raise RuntimeError("MinerU 请求已取消")
             name = str(ep.get("name") or ep.get("url") or "endpoint")
+            # 端点熔断：连接级失败后 TTL 内直接跳过（死端点不再逐篇空耗连接超时）
+            down_until = self._endpoint_down_until.get(name, 0.0)
+            if down_until > time.time():
+                attempts.append({
+                    "name": name,
+                    "error": f"端点近期连接失败，熔断跳过（{int(down_until - time.time())}s 后重探）",
+                })
+                logger.info("MinerU 端点 %s 熔断期内跳过（%ss 后重探）", name, int(down_until - time.time()))
+                continue
+            # 端点槽位：按**实际使用的端点**取得（编排层注入）。回退时先释放前一个端点的槽位，
+            # 避免"占着失败端点的额度、实际压另一个端点"（2026-10-14 端点分流配套）。
+            acquired = False
+            if self.slot_acquire is not None:
+                self.slot_acquire(name)
+                acquired = True
             try:
                 result = self._parse_zip_api_file(
                     input_path, output_dir,
@@ -614,16 +652,40 @@ class MinerUParser:
                     _retry_count=_retry_count, _force_ocr=_force_ocr,
                 )
                 if result.get("success"):
+                    self._endpoint_down_until.pop(name, None)
                     return result
                 attempts.append({"name": name, "error": result.get("error")})
                 logger.warning("MinerU 端点 %s 解析失败，尝试下一端点: %s", name, result.get("error"))
+                self._mark_endpoint_down_if_connect_error(name, result.get("error"))
             except Exception as exc:
                 if self._abort_event.is_set():
                     raise RuntimeError("MinerU 请求已取消") from exc
                 logger.warning("MinerU 端点 %s 异常: %s", name, exc)
                 attempts.append({"name": name, "error": str(exc)})
+                self._mark_endpoint_down_if_connect_error(name, str(exc))
+            finally:
+                if acquired and self.slot_release is not None:
+                    self.slot_release(name)
         detail = "；".join(f"{a['name']}: {a['error']}" for a in attempts)
         return self._build_parse_result(False, error=detail)
+
+    def _mark_endpoint_down_if_connect_error(self, name: str, err_text: Any) -> None:
+        """连接级失败（不可达/连接超时/重试耗尽）→ 熔断该端点 TTL 秒；业务级失败不熔断。
+
+        只认连接阶段信号（connect timeout / NewConnectionError / Max retries / refused），
+        读取超时（大册慢）与 RemoteDisconnected（网关吞连接）不算——主端点被误熔断代价更大。
+        """
+        text = str(err_text or "")
+        connect_markers = (
+            "connect timeout", "Max retries exceeded", "NewConnectionError",
+            "Connection refused", "Failed to establish", "Connection aborted",
+        )
+        if any(marker in text for marker in connect_markers):
+            self._endpoint_down_until[name] = time.time() + self.endpoint_down_ttl
+            logger.warning(
+                "MinerU 端点 %s 判定为连接级失败，熔断 %ss（期内跳过）: %s",
+                name, self.endpoint_down_ttl, text[:120],
+            )
 
     def _parse_zip_api_file(self, input_path: str, output_dir: str, api_endpoint: str, api_key: str, _retry_count: int = 0, _force_ocr: Optional[bool] = None) -> Dict[str, Any]:
         """file_parse ZIP 协议单文件解析（所有端点统一走此协议）。
@@ -658,7 +720,7 @@ class MinerUParser:
                         **({'is_ocr': 'true'} if use_ocr else {}),
                         'is_async': 'false',
                     },
-                    timeout=self.company_api_timeout,
+                    timeout=(self.connect_timeout, self.company_api_timeout),
                     verify=False,
                 )
 
