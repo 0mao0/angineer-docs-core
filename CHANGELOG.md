@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6
+
+- feat: **`KB_STACK=pg` 档位（PostgreSQL + pgvector 存储后端）**——`pg_support` 把 sqlite3 连接协议翻译成 PG 方言（占位符 / `INSERT OR REPLACE`→`ON CONFLICT` / `LIKE`→`ILIKE` / `PRAGMA table_info`→information_schema / `AUTOINCREMENT`→`BIGSERIAL`），`KB_STACK=legacy|pg` 一个键原子切换、禁半迁移；新增 `PgVectorStore`（`collection_name` 复刻组隔离、`score=1-<=>`）；meta/index/canonical PG 子类，FTS 对等走 bigram 写入侧展开 + tsvector 生成列（bm25 升序语义以 `-ts_rank` 保持）；registry / parse_records / 壳 `/health` 按档位分支
+- feat: **知识库并入业务库同 database，独立 schema `dredge_knowledge`**——所有连接注入 `-c search_path=dredge_knowledge,public`，核心代码裸表名零改写（`KNOWLEDGE_PG_SCHEMA` 可覆盖）；建库时 `CREATE SCHEMA IF NOT EXISTS` + 扩展显式装 `public`；information_schema 的主键/列清单查询加 `current_schemas(false)` 过滤，同库并存业务表不误命中
+- feat: **中性语料包 v2（`format=neutral-v2`）**——canonical 模型形状 jsonl.gz + doc_blocks/segments 行级 + vectors parquet + sha256/计数 manifest；导出/导入走存储抽象，legacy/pg 双源双目标；导入支持 stages 断点续跑、`allow_existing`、index 段每 2000 行分批提交（48 万行单事务在远程实例断连即全盘失败），收尾自动 ANALYZE（无统计时检索 1.5s→16s）
+- feat: 系统不再自动创建 default 库（空注册表保持空清单），default 删除保护放开——任何注册库都可删；PG 档位删库清理补全（canonical / 块表 / parse_records / meta 全清，此前只清向量 / 文件 / 注册表）
+- fix(pg): 导入链路四连修——长 chunk 触发 PG btree 单行 2704 字节上限（改 `substring(text_clean for 500)` 前缀函数索引）；短连接在远程实例第 3328 个点撞超时（thread-local 长连接 + ping 重建 + 连接重试 3 次）；小盘实例并行查询/建索引动态共享内存 DiskFull（会话禁并行）；HNSW 索引删除判据不再依赖 DDL rowcount（恒 -1 致删而不建）
+- fix(registry): 自定义库组查表按 search_path——`information_schema` 写死 `table_schema='public'` 致建组回读恒判「表不存在」（`create_group` 断言必挂、`list_custom_groups` 恒空、往自定义组建库被判未知组）
+- fix: 读穿与导出两修——`get_node` 改读穿 meta（导入后不重启壳，回源/引用不再 404）；中性包导出向量按库直筛 `iter_records(library_id=...)`，不再整 collection 扫描后过滤
+
 ## 0.1.5
 
 - feat: 图谱存储按库拆分（一库一文件）——全局 `graph.sqlite` 改为每库 `knowledge/libraries/<库>/graph.sqlite`，启动首跑自动拆分迁移（备份改名、逐表对账、幂等可重跑；失败不阻塞启动、读写回退全局文件）；图谱页签与 API、维护任务、导出产物查找全部改按库解析；拆并适配跨文件迁移
