@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "angineer-docs-core"
-version = "0.1.5"
+version = "0.1.6"
 description = "AnGIneer docs engine: parse pipeline (source_prep -> MinerU -> PoPo -> structure -> FTS -> vectors -> graph), retrieval and export"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -49,6 +49,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# KB_STACK=pg 档位（PostgreSQL+pgvector）：psycopg3 连接 + 中性包 parquet 向量文件。
+# legacy 档位无需安装本 extra（模块内全部惰性 import）。
+pg = [
+    "psycopg[binary]>=3.2",
+    "pyarrow>=15.0",
+]
 # [popo] extra 已退役（2026-10-29 docs-core 0.1.5 发布实踩）：PyPI 禁止元数据含 git 直引
 # 依赖（400 Can't have direct dependency），popo-client 又未上 PyPI——两端都不成立。
 # popo 客户端获取：主仓容器 vendor wheel；外部用户自行从 dgx-spark-popo 公开仓安装。
