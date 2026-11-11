@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7
+
+- feat: **解析面进包 `docs_core.docs_api`（`[api]` extra）**——宿主 docs-api 的 v1 解析面（上传/断点续跑/状态轮询/产物下载）收进包，与检索面 `docs_core.server:app` 并列的第二入口；不依赖 cwd/sys.path/`ports.json`，端口由 uvicorn 参数决定：`uvicorn docs_core.docs_api:app --port 8312`；可选入口 `python -m docs_core.docs_api` 带 `DOCS_API_SINGLE_INSTANCE_GUARD=1` 单实例守卫（默认关）。`GET /health` 契约：HTTP 200 + `{service, started_at, pid, status: ok|degraded, config_errors?}`，配置漂移或向量守卫异常时 degraded——消费方按 body 判就绪，不只看状态码。`[api]` extra 依赖全为 PyPI 已发布包并写下限：`fastapi>=0.100` / `uvicorn>=0.30` / `python-multipart>=0.0.6`；`config_validator` 等价校验内联进包（`angineer-shared` 未上 PyPI 不引入），MINERU_CONFIGS 必填、POPO/EMBEDDING/RERANKER 可选（软阶段降级链）
+- feat: **静态键鉴权（`DOCS_API_STATIC_KEYS`，逗号分隔）**——`/api/v1/*` 强制 `X-API-Key` 头；命中即放行，视作未绑定库的键（不注入也不限制查询参数 `library_id`，调用方显式传库、不传落 `default`）；键未配置时行为与宿主一致（无头 401、无效键 403）；静态键 principal（`id=None`）跳过 resume 归属比对，DB 键语义不变。键管理界面/会话/用户体系不进包（宿主网页端诉求）；上传文档仍进 API 专属文件夹（静态键文件夹名 `StaticAPI（键尾4位）`）
+- feat: **解析记录走 `KB_STACK` 档位适配层**——包内记录层全部经 `docs_core.parse_records_store`（其 `connect()` 按 `is_pg()` 分流）；store 新增 `list_by_doc_id` / `list_records` / `soft_delete_record`，`insert_record` 支持 `api_key_id`。启动自愈（任务级+行级兜底，重启遗留 queued/processing 标 failed 可 resume）与图谱一库一文件拆分随包；启动向量守卫随包（embedding 维度探针，非阻塞）
+- feat: **R4 两点确认结论（PG 档位落盘行为，消费方对接依据）**——① FTS：pg 档位**不是 FTS5 降级**，`sqlite_index.py` 本体无 pg 分支但 FTS 重建经 `docs_service` 装配路由到 `PgCanonicalSQLiteStore`：写入侧 bigram 展开 + `canonical_chunk_fts.fts` tsvector 生成列（GIN），查询 `to_tsquery('simple')`，bm25 升序语义以 `-ts_rank` 对齐（0.1.6 已随 pg 档上线）；legacy 档位仍是 FTS5。② 首连建库 DDL：`pg_support.iter_pg_ddl` 覆盖 `parse_records` / `parse_task_steps` / `parse_stage_steps`（含索引）与 `doc_blocks` 等全部派生表，`_AUTOINCREMENT_TABLES` 四表齐（serial 主键自动 RETURNING 支撑 `last_insert_rowid`），任务记录表随首连自动建，无需手工迁移
+- chore: 宿主 `services/docs-api`（主仓库目录宿主）不受影响——旧宿主继续 sys.path 方式运行网页端全功能，其空壳 `pyproject.toml`（0.2.7，`py-modules=[]`）已标注 deprecated 指向 `docs_core[api]`
+
 ## 0.1.6
 
 - feat: **`KB_STACK=pg` 档位（PostgreSQL + pgvector 存储后端）**——`pg_support` 把 sqlite3 连接协议翻译成 PG 方言（占位符 / `INSERT OR REPLACE`→`ON CONFLICT` / `LIKE`→`ILIKE` / `PRAGMA table_info`→information_schema / `AUTOINCREMENT`→`BIGSERIAL`），`KB_STACK=legacy|pg` 一个键原子切换、禁半迁移；新增 `PgVectorStore`（`collection_name` 复刻组隔离、`score=1-<=>`）；meta/index/canonical PG 子类，FTS 对等走 bigram 写入侧展开 + tsvector 生成列（bm25 升序语义以 `-ts_rank` 保持）；registry / parse_records / 壳 `/health` 按档位分支
