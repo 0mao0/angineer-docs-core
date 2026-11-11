@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.8
+
+> 本版吸收 DredgeAI《0.1.7 接入验收问题反馈》全部五项；一、二两项即为贵方本地 hotfix 所对应改动，0.1.8 起可移除临时补丁。
+
+- fix(pg): **PG 档位首次解析必崩（反馈·一，阻断）**——`PgConnection.execute()` 此前漏调 `_maybe_add_returning()`，serial 主键表（`parse_records`/`parse_task_steps`/`parse_stage_steps`/`doc_blocks` 四表）INSERT 不补 `RETURNING`，`last_insert_rowid()` 恒返回 `(None,)`，解析面台账插入 `int(None)` TypeError 500；现 execute 对 `_AUTOINCREMENT_TABLES` 全表接线（回归测试 2 例，已验证无修复必红）
+- fix(api): **中文文件名落盘失败（反馈·二，阻断）**——.NET 客户端按 RFC 2047 把非 ASCII 文件名编码为 encoded-word（`=?utf-8?B?...?=`），python-multipart 0.0.33 不解码，Windows 文件名禁 `?` → `open()` OSError [Errno 22]；新增 `docs_api._filename.normalize_upload_filename`：逐个 encoded-word 独立解码（明文段原样保留，多段交错安全）+ Windows 非法字符/保留设备名/路径分隔清洗，服务端不依赖客户端处理（中文原名保留）；包内与宿主 v1 同款接入。单测 7 例
+- fix(api): **v1 DELETE 对齐网页端完整删除语义（反馈·三）**——此前只软删台账行，知识树节点与派生层（canonical/chunks/FTS/向量/图谱/文件）原样留存，DELETE 后检索仍命中已删文档；现走 `ks.delete_node()` 级联清理（含取消在跑任务），台账行软删留痕，幂等 404 契约不变。真 PG 档实证：删后检索 0 命中、canonical_chunks/FTS/vector_records/parse_tasks/doc_blocks 全清零
+- fix(mineru): **`verify=False` 硬编码改 env 可配（反馈·四）**——新增 `MINERU_VERIFY_SSL`（三处 HTTP 调用），**默认 `true`（校验上游证书，安全默认收紧）**；自签网关经 `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE` 信任，遗留明文 IP 自签部署设 `MINERU_VERIFY_SSL=0` 回退旧行为
+- fix(popo): **`is_available()` 认 `POPO_DOC_API_URL`（反馈·五）**——文档级 HTTP API 通道已设置即视为可用，纯 HTTP 部署（无 popo 源码树）popo 阶段不再被「依赖缺失」skipped；子进程链回退模式判定不变
+
 ## 0.1.7
 
 - feat: **解析面进包 `docs_core.docs_api`（`[api]` extra）**——宿主 docs-api 的 v1 解析面（上传/断点续跑/状态轮询/产物下载）收进包，与检索面 `docs_core.server:app` 并列的第二入口；不依赖 cwd/sys.path/`ports.json`，端口由 uvicorn 参数决定：`uvicorn docs_core.docs_api:app --port 8312`；可选入口 `python -m docs_core.docs_api` 带 `DOCS_API_SINGLE_INSTANCE_GUARD=1` 单实例守卫（默认关）。`GET /health` 契约：HTTP 200 + `{service, started_at, pid, status: ok|degraded, config_errors?}`，配置漂移或向量守卫异常时 degraded——消费方按 body 判就绪，不只看状态码。`[api]` extra 依赖全为 PyPI 已发布包并写下限：`fastapi>=0.100` / `uvicorn>=0.30` / `python-multipart>=0.0.6`；`config_validator` 等价校验内联进包（`angineer-shared` 未上 PyPI 不引入），MINERU_CONFIGS 必填、POPO/EMBEDDING/RERANKER 可选（软阶段降级链）
