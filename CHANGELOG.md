@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9
+
+- fix(api): **v1 parse 知识树节点 title 传归一后文件名（0.1.8 复验残留）**——0.1.8 修二覆盖了 ext/台账/落盘三处，漏了 `register_document(title=...)`：encoded-word 文件名解析成功但 `nodes.title` 存的是 `=?utf-8?B?...?=` 原样串，读标/知识树显示名乱码；现传归一后值（宿主 v1 同款）。上传后 `nodes.title` 与 `parse_records.file_name`、source 文件名三处一致
+
 ## 0.1.8
 
 > 本版吸收 DredgeAI《0.1.7 接入验收问题反馈》全部五项；一、二两项即为贵方本地 hotfix 所对应改动，0.1.8 起可移除临时补丁。
