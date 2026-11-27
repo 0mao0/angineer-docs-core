@@ -187,7 +187,7 @@ class TestLocalStatsTitles:
         import docs_core.paths as docs_paths
 
         monkeypatch.setattr(docs_paths, "resolve_knowledge_meta_db_path", lambda: tmp_path / "meta.sqlite")
-        monkeypatch.setattr(docs_paths, "resolve_repo_root", lambda: tmp_path)
+        monkeypatch.setenv("PARSE_RECORDS_DB_PATH", str(tmp_path / "data" / "parse_records.sqlite"))
         return agent_port.local_stats("default")
 
     def test_titles_enumeration_field(self, tmp_path, monkeypatch):
