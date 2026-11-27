@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.10
+
+- fix: **`/api/knowledge/stats` by_library 分组带 l.name（`GROUP BY n.library_id, l.name`）**——原 SQL 只按 `n.library_id` 分组但选取裸列 `l.name`，SQLite 放行后同 library_id 下 name 取值不确定（多库同名/缺库 LEFT JOIN 情形漂移），前端/调用方拿到不稳定的 library_name；同款缺陷修复 `step09_query/agent_port.py` 同一条聚合。纯修复，无行为契约变化
+
 ## 0.1.9
 
 - fix(api): **v1 parse 知识树节点 title 传归一后文件名（0.1.8 复验残留）**——0.1.8 修二覆盖了 ext/台账/落盘三处，漏了 `register_document(title=...)`：encoded-word 文件名解析成功但 `nodes.title` 存的是 `=?utf-8?B?...?=` 原样串，读标/知识树显示名乱码；现传归一后值（宿主 v1 同款）。上传后 `nodes.title` 与 `parse_records.file_name`、source 文件名三处一致
