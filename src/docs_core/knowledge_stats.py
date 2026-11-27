@@ -41,7 +41,7 @@ def compute_knowledge_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
                 "SELECT n.library_id, l.name, COUNT(*) FROM nodes n"
                 " LEFT JOIN libraries l ON n.library_id = l.id"
                 f" WHERE n.deleted=0{lib_clause.replace('library_id', 'n.library_id')}"
-                " GROUP BY n.library_id ORDER BY COUNT(*) DESC",
+                " GROUP BY n.library_id, l.name ORDER BY COUNT(*) DESC",
                 lib_params,
             )
         ]

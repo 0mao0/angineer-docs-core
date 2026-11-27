@@ -451,7 +451,7 @@ def local_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
                 "SELECT n.library_id, l.name, COUNT(*) FROM nodes n"
                 " LEFT JOIN libraries l ON n.library_id = l.id"
                 f" WHERE n.deleted=0{lib_clause.replace('library_id', 'n.library_id')}"
-                " GROUP BY n.library_id ORDER BY COUNT(*) DESC",
+                " GROUP BY n.library_id, l.name ORDER BY COUNT(*) DESC",
                 lib_params,
             )
         ]
@@ -682,3 +682,17 @@ def table_blocks_provider(
                 "page_idx": table.page_start,
             })
     return out
+
+
+def table_sql(
+    table_id: str,
+    sql: str = "",
+    library_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """表内数据查询本地实现（2026-11-14 问表）：直调 step09_query.table_sql。
+
+    与 docs-api /internal/table-sql 同一实现（单一真相源），HTTP 失败时的进程内兜底。
+    """
+    from .table_sql import run_table_sql
+
+    return run_table_sql(table_id=table_id, sql=sql, library_id=library_id)
