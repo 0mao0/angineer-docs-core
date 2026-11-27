@@ -424,7 +424,9 @@ def local_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
     import sqlite3
     from datetime import datetime, timedelta, timezone
 
-    from ..paths import resolve_knowledge_meta_db_path, resolve_repo_root
+    from ..parse_records_store import connect as _parse_records_connect
+    from ..pg_support import is_pg as _is_pg
+    from ..paths import resolve_knowledge_meta_db_path
 
     lib_clause = " AND library_id = ?" if library_id else ""
     lib_params: tuple = (library_id,) if library_id else ()
@@ -484,8 +486,8 @@ def local_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
     finally:
         conn.close()
 
-    records_db = resolve_repo_root() / "data" / "parse_records.sqlite"
-    rconn = sqlite3.connect(f"file:{records_db}?mode=ro", uri=True)
+    rconn = _parse_records_connect()
+    month_expr = "substring(created_at from 1 for 7)" if _is_pg() else "substr(created_at,1,7)"
     try:
         rec_base = "status<>'deleted'" + lib_clause
         recent_7d = rconn.execute(
@@ -499,8 +501,8 @@ def local_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
         by_month = [
             {"month": r[0], "count": r[1]}
             for r in rconn.execute(
-                f"SELECT substr(created_at,1,7), COUNT(*) FROM parse_records WHERE {rec_base}"
-                " GROUP BY substr(created_at,1,7) ORDER BY 1",
+                f"SELECT {month_expr}, COUNT(*) FROM parse_records WHERE {rec_base}"
+                f" GROUP BY {month_expr} ORDER BY 1",
                 lib_params,
             )
         ]

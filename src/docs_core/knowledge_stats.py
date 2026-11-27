@@ -7,12 +7,12 @@ docs-api 路由改为调用本函数；壳（``docs_core.server``）直接调用
 （status<>'deleted'）。parse_records 库路径经 ``parse_records_store.db_path()``
 （``PARSE_RECORDS_DB_PATH`` > ``ANGINEER_DATA_ROOT``/knowledge > 仓库 data）。
 """
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from .docs_service import get_docs_service
-from .parse_records_store import db_path as _parse_records_db_path
+from .parse_records_store import connect as _parse_records_connect
+from .pg_support import is_pg
 
 
 def compute_knowledge_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
@@ -71,9 +71,9 @@ def compute_knowledge_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
             lib_params,
         ).fetchall()
 
-    # parse_records 是独立 SQLite 文件，单独连接聚合（不与 meta 库跨库 JOIN）
-    rconn = sqlite3.connect(_parse_records_db_path())
-    rconn.row_factory = sqlite3.Row
+    # parse_records 是独立存储（legacy: SQLite 文件；pg 档：PG 同库），单独连接聚合
+    rconn = _parse_records_connect()
+    month_expr = "substring(created_at from 1 for 7)" if is_pg() else "substr(created_at,1,7)"
     try:
         rec_base = "status<>'deleted'" + lib_clause
         now = datetime.now(timezone.utc)
@@ -88,8 +88,8 @@ def compute_knowledge_stats(library_id: Optional[str] = None) -> Dict[str, Any]:
         by_month = [
             {"month": r[0], "count": r[1]}
             for r in rconn.execute(
-                f"SELECT substr(created_at,1,7), COUNT(*) FROM parse_records WHERE {rec_base}"
-                " GROUP BY substr(created_at,1,7) ORDER BY 1",
+                f"SELECT {month_expr}, COUNT(*) FROM parse_records WHERE {rec_base}"
+                f" GROUP BY {month_expr} ORDER BY 1",
                 lib_params,
             )
         ]
