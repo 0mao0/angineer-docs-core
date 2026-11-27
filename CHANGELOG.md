@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.11
+
+- fix: **PG 档位 `/api/knowledge/stats` 500（`no such table: parse_records`）**——`compute_knowledge_stats` 的 uploads 段此前恒走 `sqlite3.connect(db_path())`，`KB_STACK=pg` 下解析记录落 PG 的 `parse_records` 表，sqlite 文件为空 → OperationalError，`/stats` 在 PG 环境永久不可用；同款修复 `step09_query/agent_port.py` `local_stats`。现两处均走 `parse_records_store.connect()`（按 `is_pg()` 分档），月份分组表达式按档位切换（`substring(...)` vs `substr(...)`），legacy 行为不变
+
 ## 0.1.10
 
 - fix: **`/api/knowledge/stats` by_library 分组带 l.name（`GROUP BY n.library_id, l.name`）**——原 SQL 只按 `n.library_id` 分组但选取裸列 `l.name`，SQLite 放行后同 library_id 下 name 取值不确定（多库同名/缺库 LEFT JOIN 情形漂移），前端/调用方拿到不稳定的 library_name；同款缺陷修复 `step09_query/agent_port.py` 同一条聚合。纯修复，无行为契约变化
